@@ -1,6 +1,6 @@
 # JARVIS
 
-A local-first personal assistant and developer command centre. V0.3 adds bounded awareness of local software projects while preserving Ollama-only conversation. JARVIS can inspect approved project metadata and Git status without receiving unrestricted filesystem or shell access.
+A local-first personal assistant and developer command centre. V0.4 adds bounded, disposable short-term conversation sessions while preserving Ollama-only conversation and V0.3 project security boundaries.
 
 ## Prerequisites
 
@@ -47,6 +47,9 @@ The default configuration is:
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=llama3.2:3b
 PROJECTS_ROOT=/Users/your-name/Developer
+CONVERSATION_TTL_SECONDS=1800
+CONVERSATION_MAX_TURNS=12
+CONVERSATION_MAX_CHARACTERS=12000
 ```
 
 Change `OLLAMA_MODEL` in the root `.env` and pull that same model to switch models without changing code. Model downloads can be large; choose one appropriate for the Mac running JARVIS.
@@ -78,6 +81,16 @@ Project-aware examples:
 
 Opening a project is the only action in V0.3. It supports VS Code and Finder, requires explicit wording, and always resolves the target from the discovered project index.
 
+### Short-term conversation context
+
+The browser creates an opaque session on first use and retains only its UUID locally. The backend keeps recent turns in memory for 30 minutes after the last request, with deterministic limits of 12 user turns and 12,000 characters. Older complete turns are dropped first; they are not summarised.
+
+Use `NEW SESSION` beside the command interface to delete the current backend session, clear the visible transcript, and create a fresh context. Restarting the API also clears every session. This is short-term working context, not long-term memory: nothing is written to SQLite, embedded, indexed, or retained indefinitely.
+
+Recent trusted project observations may resolve follow-ups such as `When was it last updated?` or `Which branch is the first one on?`. Ambiguous references prompt for clarification. Conversation context never supplies paths, grants launch permission, or bypasses project-ID and tool validation.
+
+Approved project-tool observations are rendered by the backend rather than reinterpreted by the model. Explicit values such as `is_dirty: false` are authoritative; commit messages or prior dialogue cannot contradict them, and uncertainty is used only for missing, errored, or ambiguous fields.
+
 ## Project security model
 
 - No recursive filesystem scan and no file-content access.
@@ -86,6 +99,7 @@ Opening a project is the only action in V0.3. It supports VS Code and Finder, re
 - Ollama can propose only registered, schema-validated tool calls.
 - Git runs as argument arrays with a short timeout; no shell is involved.
 - `.env`, SSH keys, credentials, and arbitrary project files are never read or sent to Ollama.
+- Session context is process-local, bounded, expires automatically, and is deleted on reset.
 
 ## Validation
 
