@@ -78,7 +78,12 @@ class OllamaService:
         grounding_prompt = (
             assistant.system_prompt
             + "\nAnswer the user's project question using only the approved tool result below. "
-            "Do not add repository facts that are absent. If the result is insufficient, say so. "
+            "Treat every explicit tool field as authoritative: report its value exactly and do "
+            "not reinterpret, second-guess, contradict, or infer it away using another field, "
+            "prior assumptions, or commentary. In particular, is_dirty=false means the working "
+            "tree is clean; commit messages do not override that value. Express uncertainty only "
+            "when the relevant value is missing, null, errored, or explicitly ambiguous. Do not "
+            "add repository facts that are absent. "
             f"Tool: {tool_name}\nResult: {json.dumps(tool_result)}"
         )
         payload: dict[str, Any] = {
