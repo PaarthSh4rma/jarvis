@@ -37,6 +37,8 @@ h1 { margin:9px 0 13px; font-size:clamp(64px,9vw,132px); line-height:.84; font-w
 .command-zone,.systems,.projects { padding:32px 0; }
 .section-label { display:flex; align-items:center; gap:13px; margin-bottom:17px; }
 .section-label span { color:var(--cyan); }.section-label h2 { margin:0; font:inherit; color:#aeb9be; }.section-label i { flex:1; height:1px; background:var(--line); }
+.session-reset { display:flex; align-items:center; gap:7px; padding:6px 8px; border:0; color:#6f858c; background:transparent; font:8px var(--font-mono); letter-spacing:.13em; cursor:pointer; }
+.session-reset:hover:not(:disabled) { color:var(--cyan); }.session-reset:disabled { opacity:.4; cursor:not-allowed; }
 .command-form { display:flex; align-items:center; gap:14px; padding:9px 10px 9px 18px; border:1px solid #324249; background:rgba(12,18,21,.78); box-shadow:0 18px 50px rgba(0,0,0,.25); }
 .transcript { max-height:340px; overflow-y:auto; margin-bottom:12px; border:1px solid var(--line); border-bottom:0; background:rgba(7,12,14,.72); }
 .message { display:grid; grid-template-columns:76px 1fr; gap:18px; padding:16px 18px; border-bottom:1px solid #1a252a; }

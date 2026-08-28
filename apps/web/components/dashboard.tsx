@@ -1,11 +1,12 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { ArrowUp, Braces, CircleDot, Cpu, FolderGit2, Github, Radio, ShieldCheck, TerminalSquare } from "lucide-react";
-import { ApiError, getHealth, getProjects, sendChat, type HealthResponse, type ProjectsResponse } from "@/lib/api";
+import { ArrowUp, Braces, CircleDot, Cpu, FolderGit2, Github, Radio, RotateCcw, ShieldCheck, TerminalSquare } from "lucide-react";
+import { ApiError, createConversation, deleteConversation, getHealth, getProjects, sendChat, type HealthResponse, type ProjectsResponse } from "@/lib/api";
 
 type Connection = { state: "checking" | "online" | "offline"; health?: HealthResponse };
 type Message = { id: number; role: "user" | "assistant" | "error"; content: string };
+const SESSION_STORAGE_KEY = "jarvis.conversation-id";
 
 export function Dashboard() {
   const [connection, setConnection] = useState<Connection>({ state: "checking" });
@@ -14,6 +15,10 @@ export function Dashboard() {
   const [sending, setSending] = useState(false);
   const [projects, setProjects] = useState<ProjectsResponse | null>(null);
   const [projectsUnavailable, setProjectsUnavailable] = useState(false);
+  const [conversationId, setConversationId] = useState<string | null>(() =>
+    typeof window === "undefined" ? null : window.localStorage.getItem(SESSION_STORAGE_KEY),
+  );
+  const [resetting, setResetting] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -40,19 +45,29 @@ export function Dashboard() {
     setCommand("");
     setSending(true);
     try {
-      const result = await sendChat(message);
+      let activeConversationId = conversationId;
+      if (!activeConversationId) {
+        const conversation = await createConversation();
+        activeConversationId = conversation.conversation_id;
+        setConversationId(activeConversationId);
+        window.localStorage.setItem(SESSION_STORAGE_KEY, activeConversationId);
+      }
+      const result = await sendChat(message, activeConversationId);
       setMessages((current) => [
         ...current,
         { id: Date.now() + 1, role: "assistant", content: result.response },
       ]);
     } catch (error) {
       const unavailable = error instanceof ApiError && error.status === 503;
+      const sessionFailure = error instanceof ApiError && [404, 410, 422].includes(error.status ?? 0);
       setMessages((current) => [
         ...current,
         {
           id: Date.now() + 1,
           role: "error",
-          content: unavailable
+          content: sessionFailure
+            ? "SESSION UNAVAILABLE — START A NEW SESSION"
+            : unavailable
             ? "OLLAMA RUNTIME UNAVAILABLE — CHECK LOCAL SERVICE"
             : error instanceof Error ? error.message : "JARVIS could not complete the request.",
         },
@@ -62,8 +77,36 @@ export function Dashboard() {
           ? { ...current, health: { ...current.health, ollama: "offline" } }
           : current);
       }
+      if (sessionFailure) {
+        setConversationId(null);
+        window.localStorage.removeItem(SESSION_STORAGE_KEY);
+      }
     } finally {
       setSending(false);
+    }
+  };
+
+  const startNewSession = async () => {
+    if (sending || resetting) return;
+    setResetting(true);
+    try {
+      if (conversationId) await deleteConversation(conversationId);
+      const conversation = await createConversation();
+      setConversationId(conversation.conversation_id);
+      window.localStorage.setItem(SESSION_STORAGE_KEY, conversation.conversation_id);
+      setMessages([]);
+      setCommand("");
+    } catch (error) {
+      setMessages((current) => [
+        ...current,
+        {
+          id: Date.now(),
+          role: "error",
+          content: error instanceof Error ? error.message : "Could not start a new session.",
+        },
+      ]);
+    } finally {
+      setResetting(false);
     }
   };
 
@@ -100,7 +143,7 @@ export function Dashboard() {
       </section>
 
       <section className="command-zone" aria-labelledby="command-title">
-        <div className="section-label"><span>01</span><h2 id="command-title">COMMAND INTERFACE</h2><i /></div>
+        <div className="section-label"><span>01</span><h2 id="command-title">COMMAND INTERFACE</h2><i /><button className="session-reset" type="button" onClick={startNewSession} disabled={sending || resetting}><RotateCcw size={12} />{resetting ? "RESETTING" : "NEW SESSION"}</button></div>
         {messages.length > 0 && (
           <div className="transcript" aria-live="polite" aria-label="Conversation transcript">
             {messages.map((message) => (
@@ -154,7 +197,7 @@ export function Dashboard() {
 
       <footer>
         <span><ShieldCheck size={14} /> LOCAL-FIRST // NO CLOUD UPLINK</span>
-        <span><Github size={14} /> PROJECT-AWARE BUILD 0.3.0</span>
+        <span><Github size={14} /> CONTEXT BUILD 0.4.0</span>
       </footer>
     </main>
   );
