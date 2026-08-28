@@ -36,10 +36,24 @@ export class ApiError extends Error {
   }
 }
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+type BrowserLocation = Pick<Location, "hostname" | "protocol">;
+
+export function resolveApiUrl(
+  configuredUrl: string | undefined,
+  browserLocation?: BrowserLocation,
+): string {
+  if (configuredUrl?.trim()) return configuredUrl.replace(/\/$/, "");
+  if (browserLocation) return `${browserLocation.protocol}//${browserLocation.hostname}:8000`;
+  return "http://localhost:8000";
+}
+
+function getApiUrl(): string {
+  const browserLocation = typeof window === "undefined" ? undefined : window.location;
+  return resolveApiUrl(process.env.NEXT_PUBLIC_API_URL, browserLocation);
+}
 
 export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
-  const response = await fetch(`${API_URL}/health`, { cache: "no-store", signal });
+  const response = await fetch(`${getApiUrl()}/health`, { cache: "no-store", signal });
   if (!response.ok) throw new Error(`Health check failed: ${response.status}`);
   const data = (await response.json()) as Partial<HealthResponse>;
   if (
@@ -55,7 +69,7 @@ export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
 }
 
 export async function sendChat(message: string, signal?: AbortSignal): Promise<ChatResponse> {
-  const response = await fetch(`${API_URL}/chat`, {
+  const response = await fetch(`${getApiUrl()}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message }),
@@ -77,7 +91,7 @@ export async function sendChat(message: string, signal?: AbortSignal): Promise<C
 }
 
 export async function getProjects(signal?: AbortSignal): Promise<ProjectsResponse> {
-  const response = await fetch(`${API_URL}/projects`, { cache: "no-store", signal });
+  const response = await fetch(`${getApiUrl()}/projects`, { cache: "no-store", signal });
   if (!response.ok) throw new ApiError("Project index is unavailable.", response.status);
   const data = (await response.json()) as Partial<ProjectsResponse>;
   if (!Array.isArray(data.projects) || !Array.isArray(data.recent_projects) || typeof data.count !== "number" || typeof data.dirty_count !== "number") {

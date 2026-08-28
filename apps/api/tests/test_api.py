@@ -89,6 +89,21 @@ def test_health_gracefully_reports_ollama_offline() -> None:
     assert response.json()["ollama"] == "offline"
 
 
+def test_chat_preflight_accepts_127_loopback_frontend() -> None:
+    with client_for(FakeOllama()) as client:
+        response = client.options(
+            "/chat",
+            headers={
+                "Origin": "http://127.0.0.1:3000",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:3000"
+
+
 def test_successful_chat_uses_jarvis_personality(tmp_path: Path) -> None:
     fake = FakeOllama(response="Good evening. Systems are nominal.")
     with client_for(fake, tmp_path) as client:
