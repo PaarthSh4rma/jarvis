@@ -106,7 +106,11 @@ class ToolRegistry:
                 assert isinstance(arguments, OpenProjectArguments)
                 project = self.projects.get(arguments.project_id)
                 self.projects.open_project(arguments.project_id, arguments.target)
-                return {"opened": project.name, "target": arguments.target}
+                return {
+                    "opened": project.name,
+                    "target": arguments.target,
+                    "project": project.public_dict(),
+                }
         except ProjectNotFoundError as error:
             raise ToolArgumentError("Unknown project identifier") from error
         raise UnknownToolError(f"Unknown tool: {call.name}")

@@ -1,4 +1,5 @@
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -13,6 +14,7 @@ class HealthResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
+    conversation_id: UUID
 
     @field_validator("message")
     @classmethod
@@ -27,6 +29,14 @@ class ChatResponse(BaseModel):
     response: str
     model: str
     assistant: Literal["jarvis"] = "jarvis"
+    conversation_id: UUID
+
+
+class ConversationResponse(BaseModel):
+    conversation_id: UUID
+    expires_in_seconds: int
+    max_turns: int
+    max_characters: int
 
 
 class ProjectResponse(BaseModel):

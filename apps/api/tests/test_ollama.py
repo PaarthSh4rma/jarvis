@@ -3,6 +3,7 @@ from typing import Any
 import pytest
 
 from jarvis_api.assistants import JARVIS
+from jarvis_api.conversations import ConversationTurn
 from jarvis_api.ollama import OllamaService
 
 
@@ -29,11 +30,28 @@ async def test_grounded_prompt_treats_explicit_tool_values_as_authoritative(
                 "latest_commit_message": "Work in progress",
             }
         },
+        history=(
+            ConversationTurn(
+                user="Was ghostcheck dirty?",
+                assistant="No, its working tree was clean.",
+                tool_observation={
+                    "tool": "get_project_status",
+                    "result": {"project": {"name": "ghostcheck", "is_dirty": False}},
+                },
+            ),
+        ),
     )
 
-    system_prompt = captured["messages"][0]["content"]
+    messages = captured["messages"]
+    system_prompt = "\n".join(
+        message["content"] for message in messages if message["role"] == "system"
+    )
     assert "Treat every explicit tool field as authoritative" in system_prompt
     assert "is_dirty=false means the working tree is clean" in system_prompt
     assert "commit messages do not override that value" in system_prompt
     assert '"is_dirty": false' in system_prompt
+    assert any(
+        message["content"].startswith("Trusted backend observation from an earlier turn")
+        for message in messages
+    )
     assert response == "ghostcheck has a clean working tree."

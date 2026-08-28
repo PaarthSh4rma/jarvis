@@ -4,7 +4,17 @@ from typing import Any
 import httpx
 
 from jarvis_api.assistants import Assistant
+from jarvis_api.conversations import ConversationTurn
 from jarvis_api.tools import ToolCall
+
+GROUNDING_INSTRUCTIONS = (
+    "Answer using only the current approved tool observation. Treat every explicit tool field "
+    "as authoritative: report its value exactly and do not reinterpret, second-guess, "
+    "contradict, or infer it away using another field, prior assumptions, or commentary. In "
+    "particular, is_dirty=false means the working tree is clean; commit messages do not override "
+    "that value. Express uncertainty only when the relevant value is missing, null, errored, or "
+    "explicitly ambiguous. Do not add repository facts that are absent."
+)
 
 
 class OllamaUnavailableError(RuntimeError):
@@ -26,12 +36,18 @@ class OllamaService:
         except (httpx.HTTPError, ValueError):
             return False
 
-    async def chat(self, message: str, assistant: Assistant) -> str:
+    async def chat(
+        self,
+        message: str,
+        assistant: Assistant,
+        history: tuple[ConversationTurn, ...] = (),
+    ) -> str:
         payload: dict[str, Any] = {
             "model": self.model,
             "stream": False,
             "messages": [
                 {"role": "system", "content": assistant.system_prompt},
+                *self._history_messages(history),
                 {"role": "user", "content": message},
             ],
         }
@@ -42,6 +58,7 @@ class OllamaService:
         message: str,
         assistant: Assistant,
         routing_context: dict[str, object],
+        history: tuple[ConversationTurn, ...] = (),
     ) -> ToolCall | None:
         routing_prompt = (
             "Decide whether the user request requires one approved project tool. "
@@ -55,7 +72,9 @@ class OllamaService:
             "stream": False,
             "format": "json",
             "messages": [
+                {"role": "system", "content": assistant.system_prompt},
                 {"role": "system", "content": routing_prompt},
+                *self._history_messages(history),
                 {"role": "user", "content": message},
             ],
         }
@@ -74,27 +93,44 @@ class OllamaService:
         assistant: Assistant,
         tool_name: str,
         tool_result: dict[str, object],
+        history: tuple[ConversationTurn, ...] = (),
     ) -> str:
-        grounding_prompt = (
-            assistant.system_prompt
-            + "\nAnswer the user's project question using only the approved tool result below. "
-            "Treat every explicit tool field as authoritative: report its value exactly and do "
-            "not reinterpret, second-guess, contradict, or infer it away using another field, "
-            "prior assumptions, or commentary. In particular, is_dirty=false means the working "
-            "tree is clean; commit messages do not override that value. Express uncertainty only "
-            "when the relevant value is missing, null, errored, or explicitly ambiguous. Do not "
-            "add repository facts that are absent. "
-            f"Tool: {tool_name}\nResult: {json.dumps(tool_result)}"
-        )
         payload: dict[str, Any] = {
             "model": self.model,
             "stream": False,
             "messages": [
-                {"role": "system", "content": grounding_prompt},
+                {"role": "system", "content": assistant.system_prompt},
+                {"role": "system", "content": GROUNDING_INSTRUCTIONS},
+                *self._history_messages(history),
+                {
+                    "role": "system",
+                    "content": (
+                        f"Current trusted backend observation from {tool_name}: "
+                        f"{json.dumps(tool_result)}"
+                    ),
+                },
                 {"role": "user", "content": message},
             ],
         }
         return await self._chat_request(payload)
+
+    @staticmethod
+    def _history_messages(history: tuple[ConversationTurn, ...]) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = []
+        for turn in history:
+            messages.append({"role": "user", "content": turn.user})
+            if turn.tool_observation:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "Trusted backend observation from an earlier turn: "
+                            + json.dumps(turn.tool_observation)
+                        ),
+                    }
+                )
+            messages.append({"role": "assistant", "content": turn.assistant})
+        return messages
 
     async def _chat_request(self, payload: dict[str, Any]) -> str:
         try:
