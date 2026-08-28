@@ -1,14 +1,19 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { ArrowUp, Braces, CircleDot, Cpu, Github, Radio, ShieldCheck, TerminalSquare } from "lucide-react";
-import { getHealth, type HealthResponse } from "@/lib/api";
+import { ArrowUp, Braces, CircleDot, Cpu, FolderGit2, Github, Radio, ShieldCheck, TerminalSquare } from "lucide-react";
+import { ApiError, getHealth, getProjects, sendChat, type HealthResponse, type ProjectsResponse } from "@/lib/api";
 
 type Connection = { state: "checking" | "online" | "offline"; health?: HealthResponse };
+type Message = { id: number; role: "user" | "assistant" | "error"; content: string };
 
 export function Dashboard() {
   const [connection, setConnection] = useState<Connection>({ state: "checking" });
   const [command, setCommand] = useState("");
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [sending, setSending] = useState(false);
+  const [projects, setProjects] = useState<ProjectsResponse | null>(null);
+  const [projectsUnavailable, setProjectsUnavailable] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -17,14 +22,53 @@ export function Dashboard() {
       .catch(() => {
         if (!controller.signal.aborted) setConnection({ state: "offline" });
       });
+    getProjects(controller.signal)
+      .then(setProjects)
+      .catch(() => {
+        if (!controller.signal.aborted) setProjectsUnavailable(true);
+      });
     return () => controller.abort();
   }, []);
 
-  const submit = (event: FormEvent) => {
+  const submit = async (event: FormEvent) => {
     event.preventDefault();
+    const message = command.trim();
+    if (!message || sending || connection.health?.ollama !== "online") return;
+
+    const userMessage: Message = { id: Date.now(), role: "user", content: message };
+    setMessages((current) => [...current, userMessage]);
+    setCommand("");
+    setSending(true);
+    try {
+      const result = await sendChat(message);
+      setMessages((current) => [
+        ...current,
+        { id: Date.now() + 1, role: "assistant", content: result.response },
+      ]);
+    } catch (error) {
+      const unavailable = error instanceof ApiError && error.status === 503;
+      setMessages((current) => [
+        ...current,
+        {
+          id: Date.now() + 1,
+          role: "error",
+          content: unavailable
+            ? "OLLAMA RUNTIME UNAVAILABLE — CHECK LOCAL SERVICE"
+            : error instanceof Error ? error.message : "JARVIS could not complete the request.",
+        },
+      ]);
+      if (unavailable) {
+        setConnection((current) => current.health
+          ? { ...current, health: { ...current.health, ollama: "offline" } }
+          : current);
+      }
+    } finally {
+      setSending(false);
+    }
   };
 
   const online = connection.state === "online";
+  const assistantOnline = online && connection.health?.ollama === "online";
 
   return (
     <main className="shell">
@@ -36,49 +80,81 @@ export function Dashboard() {
 
       <section className="hero" aria-labelledby="assistant-name">
         <div className="identity">
-          <div className={`orb ${online ? "orb-online" : ""}`} aria-hidden="true">
+          <div className={`orb ${assistantOnline ? "orb-online" : ""}`} aria-hidden="true">
             <div className="orb-core" /><div className="orbit orbit-one" /><div className="orbit orbit-two" />
           </div>
           <div>
             <p className="eyebrow">ASSISTANT CORE / 01</p>
             <h1 id="assistant-name">JARVIS</h1>
-            <div className={`status ${connection.state}`}>
-              <span /> {connection.state === "checking" ? "CONNECTING" : online ? "ONLINE" : "OFFLINE"}
+            <div className={`status ${connection.state === "checking" ? "checking" : assistantOnline ? "online" : "offline"}`}>
+              <span /> {connection.state === "checking" ? "CONNECTING" : assistantOnline ? "ONLINE" : "OFFLINE"}
             </div>
           </div>
         </div>
 
         <div className="readout" aria-label="System readout">
-          <div><span>MODEL</span><strong>NOT CONFIGURED</strong></div>
-          <div><span>API</span><strong>{online ? connection.health?.service.toUpperCase() : "UNREACHABLE"}</strong></div>
-          <div><span>RUNTIME</span><strong>LOCAL</strong></div>
+          <div><span>MODEL</span><strong>{online ? connection.health?.model.toUpperCase() : "UNKNOWN"}</strong></div>
+          <div><span>API</span><strong>{online ? "ONLINE" : "UNREACHABLE"}</strong></div>
+          <div><span>OLLAMA</span><strong>{online ? connection.health?.ollama.toUpperCase() : "UNKNOWN"}</strong></div>
         </div>
       </section>
 
       <section className="command-zone" aria-labelledby="command-title">
         <div className="section-label"><span>01</span><h2 id="command-title">COMMAND INTERFACE</h2><i /></div>
+        {messages.length > 0 && (
+          <div className="transcript" aria-live="polite" aria-label="Conversation transcript">
+            {messages.map((message) => (
+              <div className={`message message-${message.role}`} key={message.id}>
+                <span>{message.role === "user" ? "YOU" : message.role === "assistant" ? "JARVIS" : "SYSTEM"}</span>
+                <p>{message.content}</p>
+              </div>
+            ))}
+            {sending && <div className="message message-assistant message-loading"><span>JARVIS</span><p>Thinking</p></div>}
+          </div>
+        )}
         <form onSubmit={submit} className="command-form">
           <TerminalSquare aria-hidden="true" size={19} />
           <label htmlFor="command" className="sr-only">Enter a command</label>
-          <input id="command" value={command} onChange={(event) => setCommand(event.target.value)} placeholder="Awaiting directive..." autoComplete="off" />
-          <button type="submit" disabled={!command.trim()} aria-label="Submit command (not yet available)"><ArrowUp size={18} /></button>
+          <input id="command" value={command} onChange={(event) => setCommand(event.target.value)} placeholder={assistantOnline ? "Awaiting directive..." : "Ollama runtime unavailable"} autoComplete="off" maxLength={4000} disabled={!assistantOnline || sending} />
+          <button type="submit" disabled={!command.trim() || !assistantOnline || sending} aria-label="Send message"><ArrowUp size={18} /></button>
         </form>
-        <p className="command-note">COMMAND EXECUTION DISABLED IN FOUNDATION MODE</p>
+        <p className="command-note">LOCAL CONVERSATION // COMMAND AND TOOL EXECUTION REMAIN DISABLED</p>
       </section>
 
       <section className="systems" aria-labelledby="systems-title">
         <div className="section-label"><span>02</span><h2 id="systems-title">SYSTEMS</h2><i /></div>
         <div className="system-grid">
-          <System icon={<Cpu />} title="Assistant model" value="Awaiting provider" state="standby" />
+          <System icon={<Cpu />} title="Assistant model" value={connection.health?.model ?? "Awaiting runtime"} state={connection.health?.ollama ?? "standby"} />
           <System icon={<Braces />} title="Coding specialist" value="Codex / separate" state="isolated" />
           <System icon={<CircleDot />} title="Persistence" value="SQLite / ready" state="ready" />
           <System icon={<Radio />} title="External links" value="No connections" state="offline" />
         </div>
       </section>
 
+      <section className="projects" aria-labelledby="projects-title">
+        <div className="section-label"><span>03</span><h2 id="projects-title">PROJECTS</h2><i /></div>
+        {projectsUnavailable ? (
+          <div className="project-empty">PROJECT INDEX UNAVAILABLE</div>
+        ) : (
+          <div className="project-console">
+            <div className="project-metric"><FolderGit2 size={18} /><span>DISCOVERED</span><strong>{projects?.count ?? "—"}</strong></div>
+            <div className="project-metric"><CircleDot size={18} /><span>DIRTY REPOSITORIES</span><strong>{projects?.dirty_count ?? "—"}</strong></div>
+            <div className="project-recent">
+              <span>RECENT ACTIVITY</span>
+              <div>
+                {projects?.recent_projects.map((project) => (
+                  <p key={project.id}><strong>{project.name}</strong><small>{project.branch ?? project.technologies[0] ?? "LOCAL"}</small></p>
+                )) ?? <p><strong>SCANNING</strong></p>}
+                {projects?.count === 0 && <p><strong>NO PROJECTS DISCOVERED</strong></p>}
+              </div>
+            </div>
+          </div>
+        )}
+      </section>
+
       <footer>
         <span><ShieldCheck size={14} /> LOCAL-FIRST // NO CLOUD UPLINK</span>
-        <span><Github size={14} /> FOUNDATION BUILD 0.1.0</span>
+        <span><Github size={14} /> PROJECT-AWARE BUILD 0.3.0</span>
       </footer>
     </main>
   );
