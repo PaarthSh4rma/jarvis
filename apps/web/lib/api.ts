@@ -38,6 +38,26 @@ export type ProjectsResponse = {
   dirty_count: number;
 };
 
+export type MemoryScope = "user" | "project";
+
+export type MemoryEntry = {
+  id: string;
+  scope: MemoryScope;
+  project_id: string | null;
+  project_name: string | null;
+  content: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type MemoryListResponse = {
+  memories: MemoryEntry[];
+  max_user_entries: number;
+  max_project_entries: number;
+  max_characters: number;
+  max_injected_characters: number;
+};
+
 export class ApiError extends Error {
   constructor(message: string, public readonly status?: number) {
     super(message);
@@ -142,4 +162,74 @@ export async function getProjects(signal?: AbortSignal): Promise<ProjectsRespons
     throw new ApiError("The project index returned an invalid response.");
   }
   return data as ProjectsResponse;
+}
+
+export async function getMemory(
+  scope: MemoryScope,
+  projectId?: string,
+  signal?: AbortSignal,
+): Promise<MemoryListResponse> {
+  const query = projectId
+    ? `?scope=project&project_id=${encodeURIComponent(projectId)}`
+    : `?scope=${scope}`;
+  const response = await fetch(`${getApiUrl()}/memory${query}`, {
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok) throw new ApiError("Memory is unavailable.", response.status);
+  const data = (await response.json()) as Partial<MemoryListResponse>;
+  if (!Array.isArray(data.memories) || typeof data.max_characters !== "number") {
+    throw new ApiError("The memory service returned an invalid response.");
+  }
+  return data as MemoryListResponse;
+}
+
+export async function addMemory(
+  scope: MemoryScope,
+  content: string,
+  projectId?: string,
+): Promise<MemoryEntry> {
+  const response = await fetch(`${getApiUrl()}/memory`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope, content, project_id: projectId ?? null }),
+  });
+  return memoryMutationResponse(response, "Could not save memory.");
+}
+
+export async function updateMemory(memoryId: string, content: string): Promise<MemoryEntry> {
+  const response = await fetch(`${getApiUrl()}/memory/${memoryId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  return memoryMutationResponse(response, "Could not update memory.");
+}
+
+export async function deleteMemory(memoryId: string): Promise<void> {
+  const response = await fetch(`${getApiUrl()}/memory/${memoryId}`, { method: "DELETE" });
+  if (!response.ok) throw new ApiError("Could not delete memory.", response.status);
+}
+
+async function memoryMutationResponse(
+  response: Response,
+  fallback: string,
+): Promise<MemoryEntry> {
+  if (!response.ok) {
+    let detail = fallback;
+    try {
+      const data = (await response.json()) as { detail?: string };
+      if (typeof data.detail === "string") detail = data.detail;
+    } catch {}
+    throw new ApiError(detail, response.status);
+  }
+  const data = (await response.json()) as Partial<MemoryEntry>;
+  if (
+    typeof data.id !== "string" ||
+    !["user", "project"].includes(data.scope ?? "") ||
+    typeof data.content !== "string"
+  ) {
+    throw new ApiError("The memory service returned an invalid response.");
+  }
+  return data as MemoryEntry;
 }

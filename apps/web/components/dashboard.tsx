@@ -3,6 +3,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import { ArrowUp, Braces, CircleDot, Cpu, FolderGit2, Github, Radio, RotateCcw, ShieldCheck, TerminalSquare } from "lucide-react";
 import { ApiError, createConversation, deleteConversation, getHealth, getProjects, sendChat, type HealthResponse, type ProjectsResponse } from "@/lib/api";
+import { MemoryPanel } from "@/components/memory-panel";
 
 type Connection = { state: "checking" | "online" | "offline"; health?: HealthResponse };
 type Message = { id: number; role: "user" | "assistant" | "error"; content: string };
@@ -195,9 +196,11 @@ export function Dashboard() {
         )}
       </section>
 
+      <MemoryPanel projects={projects?.projects ?? []} />
+
       <footer>
         <span><ShieldCheck size={14} /> LOCAL-FIRST // NO CLOUD UPLINK</span>
-        <span><Github size={14} /> CONTEXT BUILD 0.4.0</span>
+        <span><Github size={14} /> MEMORY BUILD 0.5.0</span>
       </footer>
     </main>
   );
