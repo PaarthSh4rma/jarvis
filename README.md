@@ -1,6 +1,6 @@
 # JARVIS
 
-A local-first personal assistant and developer command centre. V0.4 adds bounded, disposable short-term conversation sessions while preserving Ollama-only conversation and V0.3 project security boundaries.
+A local-first personal assistant and developer command centre. V0.5 adds small, explicit, persistent memory while preserving bounded sessions, Ollama-only conversation, and the existing project security boundaries.
 
 ## Prerequisites
 
@@ -50,6 +50,10 @@ PROJECTS_ROOT=/Users/your-name/Developer
 CONVERSATION_TTL_SECONDS=1800
 CONVERSATION_MAX_TURNS=12
 CONVERSATION_MAX_CHARACTERS=12000
+JARVIS_MEMORY_MAX_USER_ENTRIES=50
+JARVIS_MEMORY_MAX_PROJECT_ENTRIES=25
+JARVIS_MEMORY_MAX_CHARACTERS=500
+JARVIS_MEMORY_MAX_INJECTED_CHARACTERS=2000
 ```
 
 Change `OLLAMA_MODEL` in the root `.env` and pull that same model to switch models without changing code. Model downloads can be large; choose one appropriate for the Mac running JARVIS.
@@ -85,11 +89,30 @@ Opening a project is the only action in V0.3. It supports VS Code and Finder, re
 
 The browser creates an opaque session on first use and retains only its UUID locally. The backend keeps recent turns in memory for 30 minutes after the last request, with deterministic limits of 12 user turns and 12,000 characters. Older complete turns are dropped first; they are not summarised.
 
-Use `NEW SESSION` beside the command interface to delete the current backend session, clear the visible transcript, and create a fresh context. Restarting the API also clears every session. This is short-term working context, not long-term memory: nothing is written to SQLite, embedded, indexed, or retained indefinitely.
+Use `NEW SESSION` beside the command interface to delete the current backend session, clear the visible transcript, and create a fresh context. Restarting the API also clears every session. Session turns remain short-term working context and are never written to SQLite.
 
 Recent trusted project observations may resolve follow-ups such as `When was it last updated?` or `Which branch is the first one on?`. Ambiguous references prompt for clarification. Conversation context never supplies paths, grants launch permission, or bypasses project-ID and tool validation.
 
 Approved project-tool observations are rendered by the backend rather than reinterpreted by the model. Explicit values such as `is_dirty: false` are authoritative; commit messages or prior dialogue cannot contradict them, and uncertainty is used only for missing, errored, or ambiguous fields.
+
+### Persistent memory
+
+Persistent memory is a separate, deliberately small collection of durable facts. User memory holds general preferences; project memory is attached to one opaque discovered-project identity. It survives sessions and backend restarts in the local SQLite database at `data/jarvis.db` by default. It never stores conversation transcripts.
+
+Memory is written only through an explicit chat request such as `Remember that I prefer pnpm`, `For RaceBrain, remember that the backend normally uses port 8000`, or through the dashboard memory panel/API. `Forget the RaceBrain port memory` removes one unambiguous match; JARVIS asks for clarification when more than one memory matches. There is no background extraction.
+
+The dashboard's compact `MEMORY` section switches between `USER MEMORY` and `PROJECT MEMORY` and supports viewing, adding, editing, and deleting entries. Equivalent API routes are:
+
+- `GET /memory` with optional `scope` and `project_id` filters
+- `POST /memory`
+- `PATCH /memory/{memory_id}`
+- `DELETE /memory/{memory_id}`
+
+Defaults are 50 user entries, 25 entries per project, 500 characters per entry, and 2,000 injected memory characters. Project memory is injected only when the current request resolves that project unambiguously. Selection is deterministic and remains separate from the 12,000-character session bound.
+
+Memory is contextual data, not authority. Precedence is `LIVE TRUSTED OBSERVATION > EXPLICIT CURRENT USER STATEMENT > PERSISTED MEMORY > MODEL INFERENCE`. Stored text cannot grant tool permission, change configured roots, override path validation, or supersede a current Git observation. Memory is clearly labelled as untrusted data in the model context, including text that resembles instructions. Entries containing common credential markers such as passwords, API keys, access tokens, secrets, or private keys are rejected; memory is not a secret store.
+
+V0.5 has no embeddings, RAG, vector database, semantic search, autonomous memory extraction, or conversation summarisation.
 
 ## Project security model
 
@@ -100,6 +123,7 @@ Approved project-tool observations are rendered by the backend rather than reint
 - Git runs as argument arrays with a short timeout; no shell is involved.
 - `.env`, SSH keys, credentials, and arbitrary project files are never read or sent to Ollama.
 - Session context is process-local, bounded, expires automatically, and is deleted on reset.
+- Persistent memory is bounded SQLite data, contains no paths or transcripts, and is never authorization.
 
 ## Validation
 
