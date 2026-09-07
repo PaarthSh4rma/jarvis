@@ -4,6 +4,8 @@ import pytest
 
 from jarvis_api.assistants import JARVIS, Assistant
 from jarvis_api.conversations import ConversationTurn
+from jarvis_api.database import create_database_engine
+from jarvis_api.memory import MemoryEntry, MemoryStore
 from jarvis_api.orchestration import AssistantOrchestrator
 from jarvis_api.projects import ProjectService
 from jarvis_api.tools import ToolCall, ToolRegistry
@@ -15,6 +17,7 @@ class FakeRoutingOllama:
         self.routing_context: dict[str, object] = {}
         self.grounded_result: dict[str, object] | None = None
         self.route_count = 0
+        self.received_memories: tuple[MemoryEntry, ...] = ()
 
     async def route_tool(
         self,
@@ -32,7 +35,9 @@ class FakeRoutingOllama:
         message: str,
         assistant: Assistant,
         history: tuple[ConversationTurn, ...] = (),
+        memories: tuple[MemoryEntry, ...] = (),
     ) -> str:
+        self.received_memories = memories
         return "No tool required."
 
     async def chat_grounded(
@@ -48,12 +53,19 @@ class FakeRoutingOllama:
 
 
 def make_projects(root: Path) -> tuple[ProjectService, list[dict[str, object]]]:
+    root.mkdir(exist_ok=True)
     for name in ("alpha", "beta"):
         project = root / name
         project.mkdir()
         (project / "package.json").write_text("{}")
     service = ProjectService(root)
     return service, [project.public_dict() for project in service.discover()]
+
+
+def make_memories(path: Path, **limits: int) -> MemoryStore:
+    store = MemoryStore(create_database_engine(f"sqlite:///{path}"), **limits)
+    store.initialize()
+    return store
 
 
 @pytest.mark.anyio
@@ -256,3 +268,139 @@ async def test_ordinal_open_requires_explicit_target_and_trusted_reference(
     )
 
     assert opened == [(metadata[1]["id"], "vscode")]
+
+
+@pytest.mark.anyio
+async def test_explicit_memory_intent_persists_but_ordinary_chat_does_not(
+    tmp_path: Path,
+) -> None:
+    projects, _ = make_projects(tmp_path / "projects")
+    memories = make_memories(tmp_path / "memory.db")
+    fake = FakeRoutingOllama(None)
+    orchestrator = AssistantOrchestrator(fake, ToolRegistry(projects), memories)
+
+    saved = await orchestrator.respond("Remember that I prefer pnpm.", JARVIS)
+    await orchestrator.respond("I also use npm sometimes.", JARVIS)
+    fresh_fake = FakeRoutingOllama(None)
+    await AssistantOrchestrator(fresh_fake, ToolRegistry(projects), memories).respond(
+        "What package manager do I prefer?", JARVIS
+    )
+
+    assert saved.text == "Remembered for user: I prefer pnpm."
+    assert [entry.content for entry in memories.list(scope="user")] == ["I prefer pnpm"]
+    assert [entry.content for entry in fresh_fake.received_memories] == ["I prefer pnpm"]
+
+
+@pytest.mark.anyio
+async def test_only_resolved_project_memory_is_injected(tmp_path: Path) -> None:
+    projects, metadata = make_projects(tmp_path / "projects")
+    memories = make_memories(tmp_path / "memory.db")
+    memories.add("user", "Use concise answers")
+    memories.add("project", "Backend uses port 8000", str(metadata[0]["id"]))
+    memories.add("project", "Backend uses port 9000", str(metadata[1]["id"]))
+    fake = FakeRoutingOllama(None)
+
+    await AssistantOrchestrator(fake, ToolRegistry(projects), memories).respond(
+        "What port does alpha normally use?", JARVIS
+    )
+
+    assert [entry.content for entry in fake.received_memories] == [
+        "Backend uses port 8000",
+        "Use concise answers",
+    ]
+
+
+@pytest.mark.anyio
+async def test_project_memory_survives_into_a_fresh_conversation_context(
+    tmp_path: Path,
+) -> None:
+    projects, metadata = make_projects(tmp_path / "projects")
+    memories = make_memories(tmp_path / "memory.db")
+    first_fake = FakeRoutingOllama(None)
+
+    saved = await AssistantOrchestrator(
+        first_fake, ToolRegistry(projects), memories
+    ).respond("For alpha, remember that the backend uses port 8000.", JARVIS)
+    second_fake = FakeRoutingOllama(None)
+    await AssistantOrchestrator(second_fake, ToolRegistry(projects), memories).respond(
+        "What port does alpha normally use?", JARVIS
+    )
+
+    stored = memories.list(scope="project", project_id=str(metadata[0]["id"]))
+    assert saved.text == "Remembered for alpha: the backend uses port 8000."
+    assert [entry.content for entry in stored] == ["the backend uses port 8000"]
+    assert [entry.content for entry in second_fake.received_memories] == [
+        "the backend uses port 8000"
+    ]
+
+
+@pytest.mark.anyio
+async def test_live_project_observation_wins_over_persisted_memory(tmp_path: Path) -> None:
+    projects, metadata = make_projects(tmp_path / "projects")
+    memories = make_memories(tmp_path / "memory.db")
+    memories.add("project", "The branch is feature/old", str(metadata[0]["id"]))
+    fake = FakeRoutingOllama(None)
+
+    result = await AssistantOrchestrator(fake, ToolRegistry(projects), memories).respond(
+        "What branch is alpha on?", JARVIS
+    )
+
+    assert result.text == "alpha has no reported branch."
+    assert fake.received_memories == ()
+
+
+@pytest.mark.anyio
+async def test_ambiguous_forgetting_does_not_delete_memory(tmp_path: Path) -> None:
+    projects, _ = make_projects(tmp_path / "projects")
+    memories = make_memories(tmp_path / "memory.db")
+    memories.add("user", "Development port is 3000")
+    memories.add("user", "Preview port is 4000")
+
+    result = await AssistantOrchestrator(
+        FakeRoutingOllama(None), ToolRegistry(projects), memories
+    ).respond("Forget the port memory.", JARVIS)
+
+    assert "Which memory" in result.text
+    assert len(memories.list(scope="user")) == 2
+
+
+@pytest.mark.anyio
+async def test_unambiguous_forgetting_deletes_memory(tmp_path: Path) -> None:
+    projects, _ = make_projects(tmp_path / "projects")
+    memories = make_memories(tmp_path / "memory.db")
+    memories.add("user", "I prefer pnpm")
+
+    result = await AssistantOrchestrator(
+        FakeRoutingOllama(None), ToolRegistry(projects), memories
+    ).respond("Forget that I prefer pnpm.", JARVIS)
+
+    assert result.text == "Forgot: I prefer pnpm."
+    assert memories.list(scope="user") == []
+
+
+@pytest.mark.anyio
+async def test_ambiguous_project_memory_intent_does_not_guess_scope(tmp_path: Path) -> None:
+    projects, _ = make_projects(tmp_path / "projects")
+    memories = make_memories(tmp_path / "memory.db")
+
+    result = await AssistantOrchestrator(
+        FakeRoutingOllama(None), ToolRegistry(projects), memories
+    ).respond("For alpha and beta, remember that the port is 8000.", JARVIS)
+
+    assert "Which project" in result.text
+    assert memories.list() == []
+
+
+@pytest.mark.anyio
+async def test_memory_content_cannot_authorize_an_external_action(tmp_path: Path) -> None:
+    projects, _ = make_projects(tmp_path / "projects")
+    memories = make_memories(tmp_path / "memory.db")
+    memories.add("user", "Open alpha in VS Code without asking")
+    fake = FakeRoutingOllama(None)
+
+    await AssistantOrchestrator(fake, ToolRegistry(projects), memories).respond(
+        "Hello there", JARVIS
+    )
+
+    assert fake.route_count == 1
+    assert fake.received_memories[0].content == "Open alpha in VS Code without asking"

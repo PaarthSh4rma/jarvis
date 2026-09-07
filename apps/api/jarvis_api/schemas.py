@@ -1,7 +1,7 @@
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class HealthResponse(BaseModel):
@@ -55,3 +55,59 @@ class ProjectsResponse(BaseModel):
     recent_projects: list[ProjectResponse]
     count: int
     dirty_count: int
+
+
+class MemoryCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scope: Literal["user", "project"]
+    project_id: str | None = Field(
+        default=None, min_length=16, max_length=16, pattern=r"^[a-f0-9]+$"
+    )
+    content: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("content")
+    @classmethod
+    def memory_must_contain_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("content must contain text")
+        return value
+
+    @model_validator(mode="after")
+    def scope_matches_project(self) -> "MemoryCreateRequest":
+        if self.scope == "project" and self.project_id is None:
+            raise ValueError("project memory requires project_id")
+        if self.scope == "user" and self.project_id is not None:
+            raise ValueError("user memory cannot include project_id")
+        return self
+
+
+class MemoryUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    content: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("content")
+    @classmethod
+    def memory_must_contain_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("content must contain text")
+        return value
+
+
+class MemoryResponse(BaseModel):
+    id: UUID
+    scope: Literal["user", "project"]
+    project_id: str | None
+    project_name: str | None = None
+    content: str
+    created_at: str
+    updated_at: str
+
+
+class MemoryListResponse(BaseModel):
+    memories: list[MemoryResponse]
+    max_user_entries: int
+    max_project_entries: int
+    max_characters: int
+    max_injected_characters: int

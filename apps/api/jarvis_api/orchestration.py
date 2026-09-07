@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from jarvis_api.assistants import Assistant
 from jarvis_api.conversations import ConversationTurn
+from jarvis_api.memory import MemoryEntry, MemoryStore
 from jarvis_api.ollama import OllamaService
 from jarvis_api.projects import ProjectNotFoundError
 from jarvis_api.tools import ToolCall, ToolError, ToolRegistry
@@ -12,9 +13,23 @@ EXPLICIT_OPEN_PATTERN = re.compile(
     re.IGNORECASE,
 )
 ORDINAL_PATTERN = re.compile(r"\b(first|1st|second|2nd|third|3rd)\s+(?:one|project)\b", re.I)
-REFERENCE_PATTERN = re.compile(r"\b(it|its|that project|the project)\b", re.I)
+REFERENCE_PATTERN = re.compile(r"\b(it|its|that project|this project|the project)\b", re.I)
 LIST_PROJECTS_PATTERN = re.compile(
     r"\b(?:what|which|list|show)\b.*\bprojects?\b", re.IGNORECASE
+)
+REMEMBER_PATTERN = re.compile(
+    r"\b(?:remember\s+that|save\s+this(?:\s*:)?|keep\s+this\s+in\s+mind(?:\s*:)?)[\s]+(.+)$",
+    re.IGNORECASE,
+)
+PROJECT_MEMORY_INTENT_PATTERN = re.compile(r"^\s*for\s+.+?,\s*remember\b", re.I)
+FORGET_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?(?:forget|remove)\s+(?:that\s+|the\s+)?(?:memory\s+)?(?:about\s+)?(.+?)(?:\s+memory)?[.!?]*\s*$",
+    re.IGNORECASE,
+)
+LIST_MEMORY_PATTERN = re.compile(r"\b(?:what|list|show)\b.*\bremember|\bmemories\b", re.I)
+LIVE_PROJECT_FIELD_PATTERN = re.compile(
+    r"\b(branch|updated|update|commit(?:ted)?|technology|technologies|stack|language|dirty|uncommitted|status)\b",
+    re.I,
 )
 ORDINAL_INDEX = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2}
 
@@ -33,9 +48,12 @@ class ReferenceResolution:
 
 
 class AssistantOrchestrator:
-    def __init__(self, ollama: OllamaService, tools: ToolRegistry) -> None:
+    def __init__(
+        self, ollama: OllamaService, tools: ToolRegistry, memories: MemoryStore | None = None
+    ) -> None:
         self.ollama = ollama
         self.tools = tools
+        self.memories = memories
 
     async def respond(
         self,
@@ -58,11 +76,17 @@ class AssistantOrchestrator:
                 "project_name": reference.project_name,
                 "instruction": "Use this exact project ID for the current reference.",
             }
+        memory_result = self._handle_memory_intent(message, reference)
+        if memory_result is not None:
+            return memory_result
+        memory_context = self._memory_context(reference.project_id)
         call = self._deterministic_tool(message, reference)
+        if call is None and reference.project_id and memory_context:
+            return AssistantResult(await self._chat(message, assistant, history, memory_context))
         if call is None:
             call = await self.ollama.route_tool(message, assistant, routing_context, history)
         if call is None:
-            return AssistantResult(await self.ollama.chat(message, assistant, history))
+            return AssistantResult(await self._chat(message, assistant, history, memory_context))
         if reference.project_id and not self._call_matches_reference(call, reference.project_id):
             return AssistantResult(
                 "I could not safely match that reference to the requested project. Which project "
@@ -92,13 +116,102 @@ class AssistantOrchestrator:
                     name="open_project",
                     arguments={"project_id": reference.project_id, "target": target},
                 )
-            return ToolCall(
-                name="get_project_status",
-                arguments={"project_id": reference.project_id},
-            )
+            if LIVE_PROJECT_FIELD_PATTERN.search(message):
+                return ToolCall(
+                    name="get_project_status",
+                    arguments={"project_id": reference.project_id},
+                )
         if LIST_PROJECTS_PATTERN.search(message):
             return ToolCall(name="list_projects", arguments={})
         return None
+
+    def _memory_context(self, project_id: str | None) -> tuple[MemoryEntry, ...]:
+        return self.memories.context(project_id) if self.memories is not None else ()
+
+    async def _chat(
+        self,
+        message: str,
+        assistant: Assistant,
+        history: tuple[ConversationTurn, ...],
+        memory_context: tuple[MemoryEntry, ...],
+    ) -> str:
+        if memory_context:
+            return await self.ollama.chat(
+                message, assistant, history, memories=memory_context
+            )
+        return await self.ollama.chat(message, assistant, history)
+
+    def _handle_memory_intent(
+        self, message: str, reference: ReferenceResolution
+    ) -> AssistantResult | None:
+        if self.memories is None:
+            return None
+        remember = REMEMBER_PATTERN.search(message)
+        if remember:
+            if PROJECT_MEMORY_INTENT_PATTERN.search(message) and not reference.project_id:
+                return AssistantResult(
+                    "Which project do you mean? I will not guess where to store that memory."
+                )
+            content = remember.group(1).strip().rstrip(".!?")
+            scope = "project" if reference.project_id else "user"
+            entry = self.memories.add(scope, content, reference.project_id)
+            label = reference.project_name if scope == "project" else "user"
+            return AssistantResult(
+                f"Remembered for {label}: {entry.content}.",
+                {
+                    "tool": "memory_add",
+                    "result": {"scope": scope, "saved": True},
+                },
+            )
+
+        forget = FORGET_PATTERN.match(message)
+        if forget:
+            candidates = list(self._memory_context(reference.project_id))
+            if reference.project_id:
+                candidates = [entry for entry in candidates if entry.scope == "project"]
+            else:
+                candidates = [entry for entry in candidates if entry.scope == "user"]
+            terms = self._memory_search_terms(forget.group(1), reference.project_name)
+            matches = [
+                entry
+                for entry in candidates
+                if terms and all(term in entry.content.casefold() for term in terms)
+            ]
+            if len(matches) > 1:
+                return AssistantResult(
+                    "Which memory do you mean? More than one saved memory matches that request."
+                )
+            if not matches:
+                return AssistantResult("I could not find a matching saved memory.")
+            self.memories.delete(matches[0].id)
+            return AssistantResult(
+                f"Forgot: {matches[0].content}.",
+                {"tool": "memory_delete", "result": {"scope": matches[0].scope}},
+            )
+
+        if LIST_MEMORY_PATTERN.search(message):
+            entries = self._memory_context(reference.project_id)
+            if reference.project_id:
+                entries = tuple(entry for entry in entries if entry.scope == "project")
+            if not entries:
+                return AssistantResult("No matching memories are saved.")
+            return AssistantResult(
+                "Saved memories: "
+                + "; ".join(f"{index}. {entry.content}" for index, entry in enumerate(entries, 1))
+                + "."
+            )
+        return None
+
+    @staticmethod
+    def _memory_search_terms(value: str, project_name: str | None) -> list[str]:
+        ignored = {"the", "that", "memory", "about", "old", "project", "s"}
+        if project_name:
+            ignored.update(re.findall(r"[a-z0-9]+", project_name.casefold()))
+        return [
+            term
+            for term in re.findall(r"[a-z0-9]+", value.casefold())
+            if term not in ignored
+        ]
 
     def _resolve_reference(
         self, message: str, history: tuple[ConversationTurn, ...]

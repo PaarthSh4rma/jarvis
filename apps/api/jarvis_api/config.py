@@ -45,6 +45,10 @@ class Settings(BaseSettings):
             "CONVERSATION_MAX_CHARACTERS", "JARVIS_CONVERSATION_MAX_CHARACTERS"
         ),
     )
+    memory_max_user_entries: int = Field(default=50, ge=1, le=500)
+    memory_max_project_entries: int = Field(default=25, ge=1, le=250)
+    memory_max_characters: int = Field(default=500, ge=50, le=4000)
+    memory_max_injected_characters: int = Field(default=2000, ge=100, le=10000)
 
     model_config = SettingsConfigDict(env_prefix="JARVIS_", env_file=".env")
 

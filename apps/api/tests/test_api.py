@@ -1,15 +1,19 @@
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 
 from jarvis_api.assistants import Assistant
 from jarvis_api.conversations import ConversationStore, ConversationTurn
 from jarvis_api.main import (
     app,
     get_conversation_store,
+    get_memory_store,
     get_ollama_service,
     get_project_service,
 )
+from jarvis_api.memory import MemoryStore
 from jarvis_api.ollama import OllamaUnavailableError
 from jarvis_api.projects import ProjectService
 from jarvis_api.tools import ToolCall
@@ -75,12 +79,22 @@ def client_for(
     fake: FakeOllama,
     projects_root: Path | None = None,
     conversations: ConversationStore | None = None,
+    memories: MemoryStore | None = None,
 ) -> TestClient:
     session_store = conversations or ConversationStore()
+    memory = memories or MemoryStore(
+        create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+    )
+    memory.initialize()
     app.dependency_overrides[get_ollama_service] = lambda: fake
     if projects_root is not None:
         app.dependency_overrides[get_project_service] = lambda: ProjectService(projects_root)
     app.dependency_overrides[get_conversation_store] = lambda: session_store
+    app.dependency_overrides[get_memory_store] = lambda: memory
     return TestClient(app)
 
 
@@ -102,7 +116,7 @@ def test_health_reports_ollama_and_model() -> None:
     assert response.json() == {
         "status": "ok",
         "service": "jarvis-api",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "ollama": "online",
         "model": "test-model",
     }
@@ -257,3 +271,70 @@ def test_expired_session_returns_controlled_response(tmp_path: Path) -> None:
 
     assert response.status_code == 410
     assert response.json()["detail"] == "Conversation expired. Start a new session."
+
+
+def test_memory_api_crud_and_scope_filtering(tmp_path: Path) -> None:
+    project = tmp_path / "alpha"
+    project.mkdir()
+    (project / "package.json").write_text("{}")
+    project_id = ProjectService(tmp_path).discover()[0].id
+
+    with client_for(FakeOllama(), tmp_path) as client:
+        user = client.post(
+            "/memory", json={"scope": "user", "content": "I prefer pnpm"}
+        )
+        project_memory = client.post(
+            "/memory",
+            json={
+                "scope": "project",
+                "project_id": project_id,
+                "content": "Backend uses port 8000",
+            },
+        )
+        listed = client.get(f"/memory?scope=project&project_id={project_id}")
+        updated = client.patch(
+            f"/memory/{user.json()['id']}", json={"content": "I prefer npm"}
+        )
+        deleted = client.delete(f"/memory/{project_memory.json()['id']}")
+
+    assert user.status_code == 201
+    assert project_memory.status_code == 201
+    assert project_memory.json()["project_name"] == "alpha"
+    assert [entry["content"] for entry in listed.json()["memories"]] == [
+        "Backend uses port 8000"
+    ]
+    assert updated.json()["content"] == "I prefer npm"
+    assert deleted.status_code == 204
+
+
+def test_memory_api_rejects_invalid_project_and_bounds(tmp_path: Path) -> None:
+    memory = MemoryStore(
+        create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        ),
+        max_characters=5,
+    )
+    memory.initialize()
+
+    with client_for(FakeOllama(), tmp_path, memories=memory) as client:
+        unknown = client.post(
+            "/memory",
+            json={
+                "scope": "project",
+                "project_id": "a" * 16,
+                "content": "fact",
+            },
+        )
+        malformed = client.post(
+            "/memory",
+            json={"scope": "project", "project_id": "../../etc", "content": "fact"},
+        )
+        oversized = client.post(
+            "/memory", json={"scope": "user", "content": "too long"}
+        )
+
+    assert unknown.status_code == 404
+    assert malformed.status_code == 422
+    assert oversized.status_code == 409

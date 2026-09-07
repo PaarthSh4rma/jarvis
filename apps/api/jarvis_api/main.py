@@ -1,6 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -15,6 +15,7 @@ from jarvis_api.conversations import (
     ConversationStore,
 )
 from jarvis_api.database import create_database_engine
+from jarvis_api.memory import MemoryEntry, MemoryLimitError, MemoryNotFoundError, MemoryStore
 from jarvis_api.ollama import OllamaService, OllamaUnavailableError
 from jarvis_api.orchestration import AssistantOrchestrator
 from jarvis_api.projects import ProjectNotFoundError, ProjectService
@@ -23,12 +24,16 @@ from jarvis_api.schemas import (
     ChatResponse,
     ConversationResponse,
     HealthResponse,
+    MemoryCreateRequest,
+    MemoryListResponse,
+    MemoryResponse,
+    MemoryUpdateRequest,
     ProjectResponse,
     ProjectsResponse,
 )
 from jarvis_api.tools import ToolRegistry
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 settings = get_settings()
 engine = create_database_engine(settings.database_url)
 ollama_service = OllamaService(settings.ollama_base_url, settings.ollama_model)
@@ -37,6 +42,13 @@ conversation_store = ConversationStore(
     ttl_seconds=settings.conversation_ttl_seconds,
     max_turns=settings.conversation_max_turns,
     max_characters=settings.conversation_max_characters,
+)
+memory_store = MemoryStore(
+    engine,
+    max_user_entries=settings.memory_max_user_entries,
+    max_project_entries=settings.memory_max_project_entries,
+    max_characters=settings.memory_max_characters,
+    max_injected_characters=settings.memory_max_injected_characters,
 )
 
 
@@ -52,15 +64,21 @@ def get_conversation_store() -> ConversationStore:
     return conversation_store
 
 
+def get_memory_store() -> MemoryStore:
+    return memory_store
+
+
 OllamaDependency = Annotated[OllamaService, Depends(get_ollama_service)]
 ProjectDependency = Annotated[ProjectService, Depends(get_project_service)]
 ConversationDependency = Annotated[ConversationStore, Depends(get_conversation_store)]
+MemoryDependency = Annotated[MemoryStore, Depends(get_memory_store)]
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
+    memory_store.initialize()
     yield
     engine.dispose()
 
@@ -70,7 +88,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -92,11 +110,12 @@ async def chat(
     service: OllamaDependency,
     projects: ProjectDependency,
     conversations: ConversationDependency,
+    memories: MemoryDependency,
 ) -> ChatResponse:
     assistant = get_assistant("jarvis")
     try:
         session = conversations.get(request.conversation_id)
-        orchestrator = AssistantOrchestrator(service, ToolRegistry(projects))
+        orchestrator = AssistantOrchestrator(service, ToolRegistry(projects), memories)
         result = await orchestrator.respond(request.message, assistant, tuple(session.turns))
         conversations.append(
             request.conversation_id,
@@ -119,6 +138,8 @@ async def chat(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Ollama is unavailable. Check that it is running and the model is installed.",
         ) from error
+    except MemoryLimitError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     return ChatResponse(
         response=result.text,
         model=service.model,
@@ -187,3 +208,107 @@ def get_project(project_id: str, projects: ProjectDependency) -> ProjectResponse
             status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
         ) from error
     return ProjectResponse.model_validate(project.public_dict())
+
+
+def _memory_response(
+    entry: MemoryEntry, project_name: str | None = None
+) -> MemoryResponse:
+    return MemoryResponse(
+        id=UUID(entry.id),
+        scope=entry.scope,
+        project_id=entry.project_id,
+        project_name=project_name,
+        content=entry.content,
+        created_at=entry.created_at.isoformat(),
+        updated_at=entry.updated_at.isoformat(),
+    )
+
+
+@app.get("/memory", response_model=MemoryListResponse, tags=["memory"])
+def list_memory(
+    memories: MemoryDependency,
+    projects: ProjectDependency,
+    scope: Literal["user", "project"] | None = None,
+    project_id: str | None = None,
+) -> MemoryListResponse:
+    if project_id is not None:
+        try:
+            projects.get(project_id)
+        except ProjectNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Project not found") from error
+        scope = "project"
+    entries = memories.list(scope=scope, project_id=project_id)
+    project_names = {project.id: project.name for project in projects.discover()} if any(
+        entry.project_id for entry in entries
+    ) else {}
+    return MemoryListResponse(
+        memories=[
+            _memory_response(
+                entry,
+                project_names.get(entry.project_id, "Unavailable project")
+                if entry.project_id
+                else None,
+            )
+            for entry in entries
+        ],
+        max_user_entries=memories.max_user_entries,
+        max_project_entries=memories.max_project_entries,
+        max_characters=memories.max_characters,
+        max_injected_characters=memories.max_injected_characters,
+    )
+
+
+@app.post(
+    "/memory",
+    response_model=MemoryResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["memory"],
+)
+def add_memory(
+    request: MemoryCreateRequest,
+    memories: MemoryDependency,
+    projects: ProjectDependency,
+) -> MemoryResponse:
+    project_name = None
+    if request.project_id is not None:
+        try:
+            project_name = projects.get(request.project_id).name
+        except ProjectNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Project not found") from error
+    try:
+        entry = memories.add(request.scope, request.content, request.project_id)
+    except MemoryLimitError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return _memory_response(entry, project_name)
+
+
+@app.patch("/memory/{memory_id}", response_model=MemoryResponse, tags=["memory"])
+def update_memory(
+    memory_id: UUID,
+    request: MemoryUpdateRequest,
+    memories: MemoryDependency,
+    projects: ProjectDependency,
+) -> MemoryResponse:
+    try:
+        entry = memories.update(str(memory_id), request.content)
+    except MemoryNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Memory not found") from error
+    except MemoryLimitError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    project_name = None
+    if entry.project_id:
+        try:
+            project_name = projects.get(entry.project_id).name
+        except ProjectNotFoundError:
+            project_name = "Unavailable project"
+    return _memory_response(entry, project_name)
+
+
+@app.delete(
+    "/memory/{memory_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["memory"]
+)
+def delete_memory(memory_id: UUID, memories: MemoryDependency) -> None:
+    try:
+        memories.delete(str(memory_id))
+    except MemoryNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Memory not found") from error
