@@ -1,10 +1,12 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 
 from jarvis_api.assistants import get_assistant
@@ -19,6 +21,15 @@ from jarvis_api.memory import MemoryEntry, MemoryLimitError, MemoryNotFoundError
 from jarvis_api.ollama import OllamaService, OllamaUnavailableError
 from jarvis_api.orchestration import AssistantOrchestrator
 from jarvis_api.projects import ProjectNotFoundError, ProjectService
+from jarvis_api.runs import (
+    RunConflictError,
+    RunExecutor,
+    RunExpiredError,
+    RunNotFoundError,
+    RunOwnershipError,
+    RunStore,
+    sse_events,
+)
 from jarvis_api.schemas import (
     ChatRequest,
     ChatResponse,
@@ -30,10 +41,13 @@ from jarvis_api.schemas import (
     MemoryUpdateRequest,
     ProjectResponse,
     ProjectsResponse,
+    RunCancelRequest,
+    RunCreateRequest,
+    RunResponse,
 )
 from jarvis_api.tools import ToolRegistry
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 settings = get_settings()
 engine = create_database_engine(settings.database_url)
 ollama_service = OllamaService(settings.ollama_base_url, settings.ollama_model)
@@ -49,6 +63,11 @@ memory_store = MemoryStore(
     max_project_entries=settings.memory_max_project_entries,
     max_characters=settings.memory_max_characters,
     max_injected_characters=settings.memory_max_injected_characters,
+)
+run_store = RunStore(
+    max_runs=settings.run_max_entries,
+    terminal_ttl_seconds=settings.run_terminal_ttl_seconds,
+    max_events_per_run=settings.run_max_events,
 )
 
 
@@ -72,6 +91,27 @@ OllamaDependency = Annotated[OllamaService, Depends(get_ollama_service)]
 ProjectDependency = Annotated[ProjectService, Depends(get_project_service)]
 ConversationDependency = Annotated[ConversationStore, Depends(get_conversation_store)]
 MemoryDependency = Annotated[MemoryStore, Depends(get_memory_store)]
+
+
+def _run_response(run: object) -> RunResponse:
+    return RunResponse(
+        run_id=run.id,
+        conversation_id=run.conversation_id,
+        state=run.state,
+        created_at=run.created_at.isoformat(),
+        started_at=run.started_at.isoformat() if run.started_at else None,
+        completed_at=run.completed_at.isoformat() if run.completed_at else None,
+    )
+
+
+def _run_http_error(error: Exception) -> HTTPException:
+    if isinstance(error, RunExpiredError):
+        return HTTPException(status_code=410, detail="Run expired.")
+    if isinstance(error, RunNotFoundError):
+        return HTTPException(status_code=404, detail="Run not found.")
+    if isinstance(error, RunOwnershipError):
+        return HTTPException(status_code=403, detail="Run ownership mismatch.")
+    return HTTPException(status_code=409, detail=str(error))
 
 
 @asynccontextmanager
@@ -146,6 +186,74 @@ async def chat(
         assistant=assistant.identifier,
         conversation_id=request.conversation_id,
     )
+
+
+@app.post(
+    "/runs",
+    response_model=RunResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["runs"],
+)
+async def create_run(
+    request: RunCreateRequest,
+    service: OllamaDependency,
+    projects: ProjectDependency,
+    conversations: ConversationDependency,
+    memories: MemoryDependency,
+) -> RunResponse:
+    try:
+        conversations.get(request.conversation_id)
+        run = run_store.create(request.conversation_id)
+    except (ConversationExpiredError, ConversationNotFoundError) as error:
+        code = 410 if isinstance(error, ConversationExpiredError) else 404
+        raise HTTPException(code, "Conversation unavailable. Start a new session.") from error
+    except RunConflictError as error:
+        raise _run_http_error(error) from error
+    orchestrator = AssistantOrchestrator(service, ToolRegistry(projects), memories)
+    executor = RunExecutor(
+        run_store,
+        conversations,
+        orchestrator,
+        get_assistant("jarvis"),
+        timeout_seconds=settings.run_timeout_seconds,
+        tool_timeout_seconds=settings.tool_timeout_seconds,
+    )
+    task = asyncio.create_task(executor.execute(run.id, request.message))
+    run_store.attach_task(run.id, task)
+    return _run_response(run)
+
+
+@app.get("/runs/{run_id}", response_model=RunResponse, tags=["runs"])
+def get_run(run_id: UUID, conversation_id: Annotated[UUID, Query()]) -> RunResponse:
+    try:
+        return _run_response(run_store.snapshot(run_id, conversation_id))
+    except (RunNotFoundError, RunExpiredError, RunOwnershipError) as error:
+        raise _run_http_error(error) from error
+
+
+@app.get("/runs/{run_id}/events", tags=["runs"])
+def stream_run_events(
+    run_id: UUID,
+    conversation_id: Annotated[UUID, Query()],
+    after: Annotated[int, Query(ge=0)] = 0,
+) -> StreamingResponse:
+    try:
+        run_store.snapshot(run_id, conversation_id)
+    except (RunNotFoundError, RunExpiredError, RunOwnershipError) as error:
+        raise _run_http_error(error) from error
+    return StreamingResponse(
+        sse_events(run_store, run_id, conversation_id, after),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/runs/{run_id}/cancel", response_model=RunResponse, tags=["runs"])
+async def cancel_run(run_id: UUID, request: RunCancelRequest) -> RunResponse:
+    try:
+        return _run_response(run_store.request_cancel(run_id, request.conversation_id))
+    except (RunNotFoundError, RunExpiredError, RunOwnershipError) as error:
+        raise _run_http_error(error) from error
 
 
 @app.post(

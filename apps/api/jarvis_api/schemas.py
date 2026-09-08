@@ -32,6 +32,33 @@ class ChatResponse(BaseModel):
     conversation_id: UUID
 
 
+class RunCreateRequest(ChatRequest):
+    model_config = ConfigDict(extra="forbid")
+
+
+class RunCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    conversation_id: UUID
+
+
+class RunResponse(BaseModel):
+    run_id: UUID
+    conversation_id: UUID
+    state: Literal[
+        "QUEUED",
+        "RUNNING",
+        "WAITING_FOR_TOOL",
+        "CANCELLING",
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+        "TIMED_OUT",
+    ]
+    created_at: str
+    started_at: str | None
+    completed_at: str | None
+
+
 class ConversationResponse(BaseModel):
     conversation_id: UUID
     expires_in_seconds: int

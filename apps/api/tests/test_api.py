@@ -1,4 +1,7 @@
+import asyncio
+import threading
 from pathlib import Path
+from uuid import UUID
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -57,6 +60,22 @@ class FakeOllama:
             raise OllamaUnavailableError("offline")
         return self.response
 
+    async def chat_stream(
+        self,
+        message: str,
+        assistant: Assistant,
+        history: tuple[ConversationTurn, ...] = (),
+        memories: tuple = (),
+    ):
+        self.received_message = message
+        self.received_history = history
+        self.received_memories = memories
+        if not self.available:
+            raise OllamaUnavailableError("offline")
+        midpoint = max(1, len(self.response) // 2)
+        yield self.response[:midpoint]
+        yield self.response[midpoint:]
+
     async def route_tool(
         self,
         message: str,
@@ -79,6 +98,18 @@ class FakeOllama:
     ) -> str:
         self.grounded_result = tool_result
         return self.response
+
+
+class SlowFakeOllama(FakeOllama):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    async def chat_stream(self, message, assistant, history=(), memories=()):
+        self.started.set()
+        await asyncio.to_thread(self.release.wait, 2)
+        yield "Done."
 
 
 def client_for(
@@ -122,7 +153,7 @@ def test_health_reports_ollama_and_model() -> None:
     assert response.json() == {
         "status": "ok",
         "service": "jarvis-api",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "ollama": "online",
         "model": "test-model",
     }
@@ -134,6 +165,118 @@ def test_health_gracefully_reports_ollama_offline() -> None:
 
     assert response.status_code == 200
     assert response.json()["ollama"] == "offline"
+
+
+def test_run_http_streams_response_and_enforces_ownership() -> None:
+    conversations = ConversationStore()
+    with client_for(
+        FakeOllama(response="Streamed response."), conversations=conversations
+    ) as client:
+        conversation_id = create_conversation(client)
+        created = client.post(
+            "/runs", json={"message": "Hello", "conversation_id": conversation_id}
+        )
+        assert created.status_code == 201
+        run_id = created.json()["run_id"]
+        events = client.get(
+            f"/runs/{run_id}/events", params={"conversation_id": conversation_id}
+        )
+        wrong_owner = client.get(
+            f"/runs/{run_id}",
+            params={"conversation_id": "22222222-2222-4222-8222-222222222222"},
+        )
+
+    assert events.status_code == 200
+    assert "assistant.delta" in events.text
+    assert "run.completed" in events.text
+    assert wrong_owner.status_code == 403
+    assert conversations.get(UUID(conversation_id)).turns[0].assistant == "Streamed response."
+
+
+def test_explicit_memory_mutation_works_through_run_runtime() -> None:
+    memory = MemoryStore(
+        create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+    )
+    with client_for(FakeOllama(), memories=memory) as client:
+        conversation_id = create_conversation(client)
+        created = client.post(
+            "/runs",
+            json={
+                "message": "Remember that I prefer pnpm.",
+                "conversation_id": conversation_id,
+            },
+        )
+        events = client.get(
+            f"/runs/{created.json()['run_id']}/events",
+            params={"conversation_id": conversation_id},
+        )
+
+    assert created.status_code == 201
+    assert "Remembered for user: I prefer pnpm." in events.text
+    assert [entry.content for entry in memory.list(scope="user")] == ["I prefer pnpm"]
+
+
+def test_run_http_enforces_conversation_concurrency_and_allows_independent_sessions() -> None:
+    fake = SlowFakeOllama()
+    with client_for(fake) as client:
+        first = create_conversation(client)
+        second = create_conversation(client)
+        run_a = client.post(
+            "/runs", json={"message": "How are you?", "conversation_id": first}
+        )
+        assert run_a.status_code == 201, run_a.text
+        duplicate = client.post("/runs", json={"message": "Again", "conversation_id": first})
+        assert fake.started.wait(timeout=1)
+        independent = client.post("/runs", json={"message": "Other", "conversation_id": second})
+        cancelled_a = client.post(
+            f"/runs/{run_a.json()['run_id']}/cancel", json={"conversation_id": first}
+        )
+        cancelled_c = client.post(
+            f"/runs/{independent.json()['run_id']}/cancel",
+            json={"conversation_id": second},
+        )
+        terminal_a = client.get(
+            f"/runs/{run_a.json()['run_id']}/events", params={"conversation_id": first}
+        )
+        fake.release.set()
+        replacement = client.post(
+            "/runs", json={"message": "Replacement", "conversation_id": first}
+        )
+        if replacement.status_code == 201:
+            client.post(
+                f"/runs/{replacement.json()['run_id']}/cancel",
+                json={"conversation_id": first},
+            )
+
+    assert run_a.status_code == independent.status_code == 201
+    assert duplicate.status_code == 409
+    assert cancelled_a.status_code == cancelled_c.status_code == 200
+    assert "run.cancelled" in terminal_a.text
+    assert replacement.status_code == 201
+
+
+def test_run_http_returns_bounded_errors_for_malformed_and_unknown_ids() -> None:
+    conversation_id = "11111111-1111-4111-8111-111111111111"
+    unknown = "99999999-9999-4999-8999-999999999999"
+    with client_for(FakeOllama()) as client:
+        malformed = client.get(
+            "/runs/not-a-uuid", params={"conversation_id": conversation_id}
+        )
+        status_response = client.get(
+            f"/runs/{unknown}", params={"conversation_id": conversation_id}
+        )
+        cancel_response = client.post(
+            f"/runs/{unknown}/cancel", json={"conversation_id": conversation_id}
+        )
+
+    assert malformed.status_code == 422
+    assert status_response.status_code == cancel_response.status_code == 404
+    assert status_response.json() == {"detail": "Run not found."}
+    assert cancel_response.json() == {"detail": "Run not found."}
 
 
 def test_chat_preflight_accepts_127_loopback_frontend() -> None:

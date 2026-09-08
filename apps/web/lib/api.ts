@@ -13,6 +13,22 @@ export type ChatResponse = {
   conversation_id: string;
 };
 
+export type RunState = "QUEUED" | "RUNNING" | "WAITING_FOR_TOOL" | "CANCELLING" | "COMPLETED" | "FAILED" | "CANCELLED" | "TIMED_OUT";
+export type RunResponse = {
+  run_id: string;
+  conversation_id: string;
+  state: RunState;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+};
+export type RunEvent = {
+  sequence: number;
+  type: string;
+  timestamp: string;
+  data: Record<string, unknown>;
+};
+
 export type ConversationResponse = {
   conversation_id: string;
   expires_in_seconds: number;
@@ -152,6 +168,70 @@ export async function sendChat(
     throw new ApiError("The assistant returned an invalid response.");
   }
   return data as ChatResponse;
+}
+
+export async function createRun(message: string, conversationId: string): Promise<RunResponse> {
+  const response = await fetch(`${getApiUrl()}/runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, conversation_id: conversationId }),
+  });
+  if (!response.ok) throw await apiError(response, "Could not start execution.");
+  const data = (await response.json()) as Partial<RunResponse>;
+  if (typeof data.run_id !== "string" || typeof data.conversation_id !== "string" || typeof data.state !== "string") {
+    throw new ApiError("The execution service returned an invalid response.");
+  }
+  return data as RunResponse;
+}
+
+export async function streamRun(
+  runId: string,
+  conversationId: string,
+  onEvent: (event: RunEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const query = new URLSearchParams({ conversation_id: conversationId });
+  const response = await fetch(`${getApiUrl()}/runs/${runId}/events?${query}`, { signal });
+  if (!response.ok || !response.body) throw await apiError(response, "Execution stream unavailable.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let terminal = false;
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      const line = frame.split("\n").find((part) => part.startsWith("data: "));
+      if (!line) continue;
+      const event = JSON.parse(line.slice(6)) as RunEvent;
+      if (typeof event.sequence !== "number" || typeof event.type !== "string") throw new ApiError("Invalid execution event.");
+      terminal = terminal || ["run.completed", "run.failed", "run.cancelled", "run.timed_out"].includes(event.type);
+      onEvent(event);
+    }
+    if (done) break;
+  }
+  if (!terminal) throw new ApiError("Execution stream ended before a terminal state.");
+}
+
+export async function cancelRun(runId: string, conversationId: string): Promise<RunResponse> {
+  const response = await fetch(`${getApiUrl()}/runs/${runId}/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversation_id: conversationId }),
+  });
+  if (!response.ok) throw await apiError(response, "Could not cancel execution.");
+  return response.json() as Promise<RunResponse>;
+}
+
+async function apiError(response: Response, fallback: string): Promise<ApiError> {
+  let detail = fallback;
+  try {
+    const data = (await response.json()) as { detail?: string };
+    if (typeof data.detail === "string") detail = data.detail;
+  } catch {}
+  return new ApiError(detail, response.status);
 }
 
 export async function getProjects(signal?: AbortSignal): Promise<ProjectsResponse> {

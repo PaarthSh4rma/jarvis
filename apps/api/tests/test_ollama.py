@@ -1,12 +1,13 @@
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 import pytest
 
 from jarvis_api.assistants import JARVIS
 from jarvis_api.conversations import ConversationTurn
 from jarvis_api.memory import MemoryEntry
-from jarvis_api.ollama import OllamaService
+from jarvis_api.ollama import OllamaService, OllamaUnavailableError
 
 
 @pytest.mark.anyio
@@ -92,3 +93,50 @@ async def test_memory_is_separate_bounded_data_not_routing_or_authorization(
         "content"
     ]
     assert messages[-1] == {"role": "user", "content": "Hello"}
+
+
+@pytest.mark.anyio
+async def test_malformed_ollama_stream_fails_safely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = OllamaService("http://localhost:11434", "test-model")
+    original_client = httpx.AsyncClient
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, text='{"message":{"content":"partial"}}\nnot-json\n')
+    )
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=transport, **kwargs),
+    )
+
+    with pytest.raises(OllamaUnavailableError):
+        _ = [chunk async for chunk in service.chat_stream("Hello", JARVIS)]
+
+
+@pytest.mark.anyio
+async def test_ollama_stream_rejects_empty_and_oversized_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = OllamaService("http://localhost:11434", "test-model")
+    original_client = httpx.AsyncClient
+    responses = iter(
+        [
+            httpx.Response(200, text='{"message":{"content":""}}\n'),
+            httpx.Response(
+                200,
+                text='{"message":{"content":"' + ("x" * 12001) + '"}}\n',
+            ),
+        ]
+    )
+    transport = httpx.MockTransport(lambda request: next(responses))
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=transport, **kwargs),
+    )
+
+    with pytest.raises(OllamaUnavailableError):
+        _ = [chunk async for chunk in service.chat_stream("Empty", JARVIS)]
+    with pytest.raises(OllamaUnavailableError):
+        _ = [chunk async for chunk in service.chat_stream("Large", JARVIS)]

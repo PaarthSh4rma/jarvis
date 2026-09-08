@@ -1,4 +1,6 @@
+import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from jarvis_api.assistants import Assistant
@@ -14,6 +16,9 @@ EXPLICIT_OPEN_PATTERN = re.compile(
 )
 OPEN_INTENT_PATTERN = re.compile(
     r"^\s*(?:please\s+)?(?:open|launch)\b", re.IGNORECASE
+)
+OPEN_DESTINATION_FOLLOWUP_PATTERN = re.compile(
+    r"^\s*(?:in\s+)?(?:vs\s*code|vscode|finder)[.!?]*\s*$", re.IGNORECASE
 )
 ORDINAL_PATTERN = re.compile(r"\b(first|1st|second|2nd|third|3rd)\s+(?:one|project)\b", re.I)
 REFERENCE_PATTERN = re.compile(r"\b(it|its|that project|this project|the project)\b", re.I)
@@ -71,11 +76,22 @@ class AssistantOrchestrator:
         message: str,
         assistant: Assistant,
         history: tuple[ConversationTurn, ...] = (),
+        *,
+        delta_handler: Callable[[str], Awaitable[None]] | None = None,
+        progress_handler: Callable[[str, str, str], None] | None = None,
+        tool_timeout_seconds: float | None = None,
+        raise_tool_errors: bool = False,
     ) -> AssistantResult:
         routing_context = self.tools.routing_context()
         reference = self._resolve_explicit_project(message, routing_context)
         if reference.project_id is None and not reference.ambiguous:
             reference = self._resolve_reference(message, history)
+        if (
+            reference.project_id is None
+            and not reference.ambiguous
+            and OPEN_DESTINATION_FOLLOWUP_PATTERN.match(message)
+        ):
+            reference = self._resolve_latest_unique_project(history)
         if reference.ambiguous:
             return AssistantResult(
                 "Which project do you mean? I do not have one unambiguous project reference."
@@ -103,7 +119,11 @@ class AssistantOrchestrator:
         if call is None and self._is_project_tool_candidate(message, reference):
             call = await self.ollama.route_tool(message, assistant, routing_context, history)
         if call is None:
-            return AssistantResult(await self._chat(message, assistant, history, memory_context))
+            return AssistantResult(
+                await self._chat(
+                    message, assistant, history, memory_context, delta_handler
+                )
+            )
         if reference.project_id and not self._call_matches_reference(call, reference.project_id):
             return AssistantResult(
                 "I could not safely match that reference to the requested project. Which project "
@@ -112,8 +132,28 @@ class AssistantOrchestrator:
 
         allow_external_actions = self._allows_external_action(message, call, reference)
         try:
-            result = self.tools.execute(call, allow_external_actions=allow_external_actions)
-        except ToolError:
+            if progress_handler:
+                description = self._tool_description(call.name, reference.project_name)
+                progress_handler("tool.requested", call.name, description)
+                progress_handler("tool.started", call.name, description)
+            if tool_timeout_seconds is None:
+                result = self.tools.execute(call, allow_external_actions=allow_external_actions)
+            else:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.tools.execute,
+                        call,
+                        allow_external_actions=allow_external_actions,
+                    ),
+                    timeout=tool_timeout_seconds,
+                )
+            if progress_handler:
+                progress_handler("tool.completed", call.name, "Tool completed")
+        except (ToolError, TimeoutError):
+            if progress_handler:
+                progress_handler("tool.failed", call.name, "Tool failed safely")
+            if raise_tool_errors:
+                raise
             return AssistantResult(
                 "I could not validate that project operation, so nothing was executed."
             )
@@ -150,7 +190,9 @@ class AssistantOrchestrator:
         """Route trusted project references and unambiguous list intent without model variance."""
         if reference.project_id:
             normalised = message.casefold().replace(" ", "")
-            if EXPLICIT_OPEN_PATTERN.search(message):
+            if EXPLICIT_OPEN_PATTERN.search(message) or OPEN_DESTINATION_FOLLOWUP_PATTERN.match(
+                message
+            ):
                 target = "finder" if "finder" in normalised else "vscode"
                 return ToolCall(
                     name="open_project",
@@ -174,12 +216,31 @@ class AssistantOrchestrator:
         assistant: Assistant,
         history: tuple[ConversationTurn, ...],
         memory_context: tuple[MemoryEntry, ...],
+        delta_handler: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
+        if delta_handler is not None:
+            chunks: list[str] = []
+            async for chunk in self.ollama.chat_stream(
+                message, assistant, history, memories=memory_context
+            ):
+                chunks.append(chunk)
+                await delta_handler(chunk)
+            return "".join(chunks)
         if memory_context:
             return await self.ollama.chat(
                 message, assistant, history, memories=memory_context
             )
         return await self.ollama.chat(message, assistant, history)
+
+    @staticmethod
+    def _tool_description(tool_name: str, project_name: str | None) -> str:
+        subject = project_name or "local projects"
+        descriptions = {
+            "get_project_status": f"Inspecting {subject} state",
+            "open_project": f"Opening {subject}",
+            "list_projects": "Inspecting local project index",
+        }
+        return descriptions.get(tool_name, "Running approved local tool")
 
     def _handle_memory_intent(
         self, message: str, reference: ReferenceResolution
@@ -355,7 +416,10 @@ class AssistantOrchestrator:
     def _allows_external_action(
         self, message: str, call: ToolCall, reference: ReferenceResolution
     ) -> bool:
-        if call.name != "open_project" or not EXPLICIT_OPEN_PATTERN.search(message):
+        if call.name != "open_project" or not (
+            EXPLICIT_OPEN_PATTERN.search(message)
+            or OPEN_DESTINATION_FOLLOWUP_PATTERN.match(message)
+        ):
             return False
         project_id = call.arguments.get("project_id")
         target = call.arguments.get("target")
@@ -373,6 +437,15 @@ class AssistantOrchestrator:
         except ProjectNotFoundError:
             return False
         return target_is_named and project.name.casefold().replace(" ", "") in normalised
+
+    def _resolve_latest_unique_project(
+        self, history: tuple[ConversationTurn, ...]
+    ) -> ReferenceResolution:
+        candidates = self._latest_candidates(history)
+        if len(candidates) != 1:
+            return ReferenceResolution(ambiguous=True)
+        project = candidates[0]
+        return ReferenceResolution(str(project["id"]), str(project["name"]))
 
     @staticmethod
     def _compact_observation(tool_name: str, result: dict[str, object]) -> dict[str, object]:

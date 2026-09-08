@@ -13,6 +13,9 @@ The implemented cross-surface contracts are:
 
 - `GET /health`: API identity/version, Ollama availability, and the server-configured model.
 - `POST /chat`: one validated user message in, one JARVIS response out.
+- `POST /runs`: create one opaque, conversation-owned execution run.
+- `GET /runs/{run_id}/events`: consume ordered structured events over SSE.
+- `POST /runs/{run_id}/cancel`: request idempotent, ownership-checked cancellation.
 - `POST /conversations`: create an opaque short-term session.
 - `DELETE /conversations/{conversation_id}`: discard a session and its context.
 - `GET /projects`: safe metadata and aggregate status for discovered projects.
@@ -20,10 +23,13 @@ The implemented cross-surface contracts are:
 - `GET/POST /memory`: list or add bounded persistent memory.
 - `PATCH/DELETE /memory/{memory_id}`: update or delete one opaque memory entry.
 
-The runtime flow is deliberately narrow:
+The runtime flow is deliberately narrow. `/chat` remains the non-streaming compatibility path:
 
 ```text
-Next.js dashboard -> FastAPI /chat -> in-memory session -> assistant orchestrator
+Next.js dashboard -> FastAPI run coordinator -> bounded run store -> SSE events
+                                      |                    ^
+                                      v                    |
+                              in-memory session -> assistant orchestrator
                                             ^                  |
                                             |                  v
                                      SQLite memory -> bounded untrusted data context
@@ -40,7 +46,7 @@ Ollama is never called from the browser. The backend selects the configured mode
 
 ## Local-first boundaries
 
-SQLite lives under the repository-local `data` directory by default and is excluded from source control. It stores only explicit persistent memory in V0.5, not chat transcripts. General settings use `JARVIS_` variables; Ollama and project discovery use the explicit `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `PROJECTS_ROOT` variables. Secrets must live only in ignored environment files or a future macOS keychain adapter.
+SQLite lives under the repository-local `data` directory by default and is excluded from source control. It stores only explicit persistent memory, not chat transcripts or V0.6 runs. General settings use `JARVIS_` variables; Ollama and project discovery use the explicit `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `PROJECTS_ROOT` variables. Secrets must live only in ignored environment files or a future macOS keychain adapter.
 
 The API is the intended boundary for persistence, model access, tools, and integrations. UI components should not reach Ollama, SQLite, or third-party services directly.
 
@@ -48,7 +54,7 @@ The API is the intended boundary for persistence, model access, tools, and integ
 
 Assistant definitions live in `jarvis_api/assistants.py`, separate from transport and routes. The registry currently contains JARVIS and can accept another personality, such as FRIDAY, without changing the Ollama service. Codex is explicitly described as a separate future coding specialist and is never used as the conversational model.
 
-The visible transcript remains browser-local React state. The browser may retain only the opaque active session UUID across refreshes. Conversation content is never stored in browser storage.
+The visible transcript remains browser-local. The opaque active session UUID is retained in `localStorage`; a bounded snapshot of completed UI exchanges is retained only in the current tab's `sessionStorage` so refresh does not erase completed work. The snapshot is capped at 24 messages and 12,000 characters, is keyed to the session UUID, excludes partial and unsuccessful runs, and is deleted by `NEW SESSION` or an invalid backend session. SQLite never stores transcripts.
 
 ## Short-term session lifecycle
 
@@ -78,7 +84,17 @@ Prompt construction keeps personality, bounded memory data, session history, rou
 LIVE TRUSTED OBSERVATION > EXPLICIT CURRENT USER STATEMENT > PERSISTED MEMORY > MODEL INFERENCE
 ```
 
-Live project-field questions continue through validated tools and deterministic formatting, so stale memory cannot override Git state. A memory cannot grant launch permission or weaken project/path validation. V0.5 adds no embedding, RAG, vector database, semantic search, autonomous extraction, or agent framework.
+Live project-field questions continue through validated tools and deterministic formatting, so stale memory cannot override Git state. A memory cannot grant launch permission or weaken project/path validation. V0.6 adds no embedding, RAG, vector database, semantic search, autonomous extraction, or agent framework.
+
+## Execution lifecycle
+
+`RunStore` centrally enforces `QUEUED -> RUNNING`, optional `WAITING_FOR_TOOL`, and exactly one of `COMPLETED`, `FAILED`, `CANCELLED`, or `TIMED_OUT`; cancellation passes through `CANCELLING`. Illegal transitions fail closed. One run may be active per conversation. Runs are process-local and bounded to 100 entries, 200 retained events each, and a 15-minute terminal TTL by default.
+
+The frontend creates a run and reads ordered SSE frames. Events contain state, bounded assistant text deltas, safe tool names, and human-readable action descriptions—never raw arguments, paths, prompts, memory rows, secrets, or model reasoning. Ollama's NDJSON stream is converted into `assistant.delta` events with a 12,000-character output ceiling. The final assembled answer is appended as one conversation turn only after successful completion.
+
+Overall runs and individual tool calls have separate configurable deadlines. Cancellation removes the run's authority to commit a result; late model or synchronous worker results cannot resurrect it. SSE supports a numeric cursor while events remain retained. Browser refresh deliberately detaches the active SSE request and does not persist run identifiers or partial output. The remounted UI restores only the matching session's bounded completed-message snapshot and returns to idle; the backend run continues independently to one terminal state.
+
+Terminal races are serialized by the run store. The first valid terminal transition wins; subsequent cancellation is idempotent and any attempted state mutation is rejected centrally. Assistant deltas and tool progress are accepted only while the run is in the corresponding active state. Malformed or oversized Ollama streams fail closed and never create a successful conversation turn.
 
 ## Project discovery
 

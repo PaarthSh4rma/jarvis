@@ -1,6 +1,6 @@
 # JARVIS
 
-A local-first personal assistant and developer command centre. V0.5 adds small, explicit, persistent memory while preserving bounded sessions, Ollama-only conversation, and the existing project security boundaries.
+A local-first personal assistant and developer command centre. V0.6 adds a bounded execution lifecycle, progressive local Ollama responses, observable tool progress, cancellation, and deterministic timeouts.
 
 ## Prerequisites
 
@@ -54,6 +54,11 @@ JARVIS_MEMORY_MAX_USER_ENTRIES=50
 JARVIS_MEMORY_MAX_PROJECT_ENTRIES=25
 JARVIS_MEMORY_MAX_CHARACTERS=500
 JARVIS_MEMORY_MAX_INJECTED_CHARACTERS=2000
+JARVIS_RUN_TIMEOUT_SECONDS=90
+JARVIS_TOOL_TIMEOUT_SECONDS=15
+JARVIS_RUN_TERMINAL_TTL_SECONDS=900
+JARVIS_RUN_MAX_ENTRIES=100
+JARVIS_RUN_MAX_EVENTS=200
 ```
 
 Change `OLLAMA_MODEL` in the root `.env` and pull that same model to switch models without changing code. Model downloads can be large; choose one appropriate for the Mac running JARVIS.
@@ -87,7 +92,7 @@ Opening a project is the only action in V0.3. It supports VS Code and Finder, re
 
 ### Short-term conversation context
 
-The browser creates an opaque session on first use and retains only its UUID locally. The backend keeps recent turns in memory for 30 minutes after the last request, with deterministic limits of 12 user turns and 12,000 characters. Older complete turns are dropped first; they are not summarised.
+The browser creates an opaque session on first use and retains its UUID locally. For refresh continuity, the current tab also keeps a bounded snapshot of completed user/assistant messages in `sessionStorage`: at most 24 messages and 12,000 characters. Active deltas and failed, cancelled, or timed-out exchanges are never added to that snapshot. The backend remains authoritative and keeps recent turns in memory for 30 minutes after the last request, with deterministic limits of 12 user turns and 12,000 characters. Older complete turns are dropped first; they are not summarised.
 
 Use `NEW SESSION` beside the command interface to delete the current backend session, clear the visible transcript, and create a fresh context. Restarting the API also clears every session. Session turns remain short-term working context and are never written to SQLite.
 
@@ -112,7 +117,17 @@ Defaults are 50 user entries, 25 entries per project, 500 characters per entry, 
 
 Memory is contextual data, not authority. Precedence is `LIVE TRUSTED OBSERVATION > EXPLICIT CURRENT USER STATEMENT > PERSISTED MEMORY > MODEL INFERENCE`. Stored text cannot grant tool permission, change configured roots, override path validation, or supersede a current Git observation. Memory is clearly labelled as untrusted data in the model context, including text that resembles instructions. Entries containing common credential markers such as passwords, API keys, access tokens, secrets, or private keys are rejected; memory is not a secret store.
 
-V0.5 has no embeddings, RAG, vector database, semantic search, autonomous memory extraction, or conversation summarisation.
+### Execution runtime
+
+The dashboard starts a run with `POST /runs`, then reads structured events from `GET /runs/{run_id}/events` using Server-Sent Events. Assistant text is assembled from `assistant.delta` events and committed to short-term session history only once the run completes. `POST /runs/{run_id}/cancel` is ownership-checked by conversation ID and is safe to repeat. The existing `POST /chat` contract remains available for compatibility.
+
+Only one run may be active per conversation; different conversations can run independently. Overall execution defaults to 90 seconds and each approved tool to 15 seconds. The in-memory store retains at most 100 runs, 200 events per run, and terminal runs for 15 minutes. A refresh detaches the browser from its current stream, restores the same conversation identity and previously completed tab-local transcript, and clears only uncommitted activity. The backend still reaches a terminal state. V0.6 does not automatically reconcile that detached result into the UI; submitting again while it remains active receives the existing controlled conflict response.
+
+Cancellation is best-effort. Ollama HTTP work is cancelled with its task. A synchronous OS tool already running in a worker thread may finish physically, but its late result cannot complete the cancelled run or be written to session history.
+
+Cancellation and timeout races use a first-terminal-outcome policy: whichever transition is accepted first wins, and every later terminal transition or output event is ignored or rejected. A validated cancellation request signals the execution task and atomically records `CANCELLING` then `CANCELLED`, including when cancellation arrives before the task starts. The 12,000-character Ollama stream ceiling is fail-closed; oversized output produces `FAILED`, and no partial response is committed to conversation history.
+
+V0.6 has no embeddings, RAG, vector database, semantic search, autonomous memory extraction, conversation summarisation, skills, delegation, schedulers, or external agent framework.
 
 ## Project security model
 

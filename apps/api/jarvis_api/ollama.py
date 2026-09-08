@@ -1,4 +1,5 @@
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -55,6 +56,51 @@ class OllamaService:
             ],
         }
         return await self._chat_request(payload)
+
+    async def chat_stream(
+        self,
+        message: str,
+        assistant: Assistant,
+        history: tuple[ConversationTurn, ...] = (),
+        memories: tuple[MemoryEntry, ...] = (),
+    ) -> AsyncIterator[str]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": assistant.system_prompt},
+                *self._memory_messages(memories),
+                *self._history_messages(history),
+                {"role": "user", "content": message},
+            ],
+        }
+        total = 0
+        has_text = False
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                async with client.stream(
+                    "POST", f"{self.base_url}/api/chat", json=payload
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        data = json.loads(line)
+                        content = data.get("message", {}).get("content", "")
+                        if not isinstance(content, str):
+                            raise ValueError("Invalid Ollama stream chunk")
+                        if content:
+                            has_text = has_text or bool(content.strip())
+                            total += len(content)
+                            if total > 12000:
+                                raise ValueError("Ollama stream exceeded output limit")
+                            yield content
+            if not has_text:
+                raise ValueError("Ollama returned an empty response")
+        except (httpx.HTTPError, json.JSONDecodeError, TypeError, ValueError) as error:
+            raise OllamaUnavailableError(
+                "Ollama is unavailable or returned an invalid response"
+            ) from error
 
     async def route_tool(
         self,

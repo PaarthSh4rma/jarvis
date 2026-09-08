@@ -1,25 +1,39 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
-import { ArrowUp, Braces, CircleDot, Cpu, FolderGit2, Github, Radio, RotateCcw, ShieldCheck, TerminalSquare } from "lucide-react";
-import { ApiError, createConversation, deleteConversation, getHealth, getProjects, sendChat, type HealthResponse, type ProjectsResponse } from "@/lib/api";
+import { FormEvent, useEffect, useRef, useState } from "react";
+import { ArrowUp, Braces, CircleDot, Cpu, FolderGit2, Github, Radio, RotateCcw, ShieldCheck, Square, TerminalSquare } from "lucide-react";
+import { ApiError, cancelRun, createConversation, createRun, deleteConversation, getHealth, getProjects, streamRun, type HealthResponse, type ProjectsResponse, type RunEvent } from "@/lib/api";
 import { MemoryPanel } from "@/components/memory-panel";
 
 type Connection = { state: "checking" | "online" | "offline"; health?: HealthResponse };
 type Message = { id: number; role: "user" | "assistant" | "error"; content: string };
 const SESSION_STORAGE_KEY = "jarvis.conversation-id";
+const TRANSCRIPT_STORAGE_KEY = "jarvis.completed-transcript.v1";
+const MAX_STORED_MESSAGES = 24;
+const MAX_STORED_CHARACTERS = 12000;
 
 export function Dashboard() {
   const [connection, setConnection] = useState<Connection>({ state: "checking" });
   const [command, setCommand] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
+  const completedMessages = useRef<Message[]>([]);
+  const streamController = useRef<AbortController | null>(null);
   const [sending, setSending] = useState(false);
   const [projects, setProjects] = useState<ProjectsResponse | null>(null);
   const [projectsUnavailable, setProjectsUnavailable] = useState(false);
   const [conversationId, setConversationId] = useState<string | null>(() =>
     typeof window === "undefined" ? null : window.localStorage.getItem(SESSION_STORAGE_KEY),
   );
+  const initialConversationId = useRef(conversationId);
   const [resetting, setResetting] = useState(false);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [progress, setProgress] = useState("IDLE");
+
+  useEffect(() => {
+    const restored = restoreCompletedTranscript(initialConversationId.current);
+    completedMessages.current = restored;
+    setMessages(restored);
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -33,7 +47,10 @@ export function Dashboard() {
       .catch(() => {
         if (!controller.signal.aborted) setProjectsUnavailable(true);
       });
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      streamController.current?.abort();
+    };
   }, []);
 
   const submit = async (event: FormEvent) => {
@@ -53,11 +70,41 @@ export function Dashboard() {
         setConversationId(activeConversationId);
         window.localStorage.setItem(SESSION_STORAGE_KEY, activeConversationId);
       }
-      const result = await sendChat(message, activeConversationId);
-      setMessages((current) => [
-        ...current,
-        { id: Date.now() + 1, role: "assistant", content: result.response },
-      ]);
+      const run = await createRun(message, activeConversationId);
+      setActiveRunId(run.run_id);
+      const assistantMessageId = Date.now() + 1;
+      let assembledResponse = "";
+      let completed = false;
+      const controller = new AbortController();
+      streamController.current = controller;
+      await streamRun(run.run_id, activeConversationId, (runEvent: RunEvent) => {
+        if (runEvent.type === "assistant.delta" && typeof runEvent.data.content === "string") {
+          assembledResponse += runEvent.data.content;
+          setMessages((current) => {
+            const existing = current.some((item) => item.id === assistantMessageId);
+            return existing
+              ? current.map((item) => item.id === assistantMessageId ? { ...item, content: item.content + runEvent.data.content } : item)
+              : [...current, { id: assistantMessageId, role: "assistant", content: runEvent.data.content as string }];
+          });
+        }
+        if (runEvent.type.startsWith("tool.") && typeof runEvent.data.message === "string") setProgress(runEvent.data.message.toUpperCase());
+        if (runEvent.type === "run.started") setProgress("PROCESSING");
+        if (runEvent.type === "run.completed") completed = true;
+        if (["run.failed", "run.cancelled", "run.timed_out"].includes(runEvent.type)) {
+          const labels: Record<string, string> = { "run.failed": "EXECUTION FAILED SAFELY", "run.cancelled": "EXECUTION CANCELLED", "run.timed_out": "EXECUTION TIMED OUT" };
+          setMessages((current) => [...current, { id: Date.now() + 2, role: "error", content: labels[runEvent.type] }]);
+        }
+      }, controller.signal);
+      if (completed && assembledResponse) {
+        const committed = boundCompletedTranscript([
+          ...completedMessages.current,
+          userMessage,
+          { id: assistantMessageId, role: "assistant", content: assembledResponse },
+        ]);
+        completedMessages.current = committed;
+        setMessages(committed);
+        storeCompletedTranscript(activeConversationId, committed);
+      }
     } catch (error) {
       const unavailable = error instanceof ApiError && error.status === 503;
       const sessionFailure = error instanceof ApiError && [404, 410, 422].includes(error.status ?? 0);
@@ -81,9 +128,24 @@ export function Dashboard() {
       if (sessionFailure) {
         setConversationId(null);
         window.localStorage.removeItem(SESSION_STORAGE_KEY);
+        window.sessionStorage.removeItem(TRANSCRIPT_STORAGE_KEY);
+        completedMessages.current = [];
       }
     } finally {
       setSending(false);
+      setActiveRunId(null);
+      setProgress("IDLE");
+      streamController.current = null;
+    }
+  };
+
+  const stopRun = async () => {
+    if (!activeRunId || !conversationId) return;
+    setProgress("CANCELLING");
+    try {
+      await cancelRun(activeRunId, conversationId);
+    } catch (error) {
+      setMessages((current) => [...current, { id: Date.now(), role: "error", content: error instanceof Error ? error.message : "Could not cancel execution." }]);
     }
   };
 
@@ -96,6 +158,8 @@ export function Dashboard() {
       setConversationId(conversation.conversation_id);
       window.localStorage.setItem(SESSION_STORAGE_KEY, conversation.conversation_id);
       setMessages([]);
+      completedMessages.current = [];
+      window.sessionStorage.removeItem(TRANSCRIPT_STORAGE_KEY);
       setCommand("");
     } catch (error) {
       setMessages((current) => [
@@ -153,16 +217,16 @@ export function Dashboard() {
                 <p>{message.content}</p>
               </div>
             ))}
-            {sending && <div className="message message-assistant message-loading"><span>JARVIS</span><p>Thinking</p></div>}
+            {sending && <div className="message message-assistant message-loading"><span>EXECUTION</span><p>{progress}</p></div>}
           </div>
         )}
         <form onSubmit={submit} className="command-form">
           <TerminalSquare aria-hidden="true" size={19} />
           <label htmlFor="command" className="sr-only">Enter a command</label>
           <input id="command" value={command} onChange={(event) => setCommand(event.target.value)} placeholder={assistantOnline ? "Awaiting directive..." : "Ollama runtime unavailable"} autoComplete="off" maxLength={4000} disabled={!assistantOnline || sending} />
-          <button type="submit" disabled={!command.trim() || !assistantOnline || sending} aria-label="Send message"><ArrowUp size={18} /></button>
+          {sending ? <button type="button" onClick={stopRun} disabled={!activeRunId} aria-label="Stop execution"><Square size={15} /> STOP</button> : <button type="submit" disabled={!command.trim() || !assistantOnline} aria-label="Send message"><ArrowUp size={18} /></button>}
         </form>
-        <p className="command-note">LOCAL CONVERSATION // COMMAND AND TOOL EXECUTION REMAIN DISABLED</p>
+        <p className="command-note">LOCAL EXECUTION RUNTIME // {sending ? progress : "READY"}</p>
       </section>
 
       <section className="systems" aria-labelledby="systems-title">
@@ -200,7 +264,7 @@ export function Dashboard() {
 
       <footer>
         <span><ShieldCheck size={14} /> LOCAL-FIRST // NO CLOUD UPLINK</span>
-        <span><Github size={14} /> MEMORY BUILD 0.5.0</span>
+        <span><Github size={14} /> EXECUTION BUILD 0.6.0</span>
       </footer>
     </main>
   );
@@ -208,4 +272,51 @@ export function Dashboard() {
 
 function System({ icon, title, value, state }: { icon: React.ReactNode; title: string; value: string; state: string }) {
   return <article className="system-item"><div className="system-icon">{icon}</div><div><h3>{title}</h3><p>{value}</p></div><span className="tag">{state}</span></article>;
+}
+
+function restoreCompletedTranscript(conversationId: string | null): Message[] {
+  if (!conversationId || typeof window === "undefined") return [];
+  try {
+    const stored = JSON.parse(window.sessionStorage.getItem(TRANSCRIPT_STORAGE_KEY) ?? "null") as {
+      conversationId?: unknown;
+      messages?: unknown;
+    } | null;
+    if (stored?.conversationId !== conversationId || !Array.isArray(stored.messages)) return [];
+    const messages = stored.messages.filter((item): item is Message => {
+      if (!item || typeof item !== "object") return false;
+      const candidate = item as Partial<Message>;
+      return typeof candidate.id === "number"
+        && (candidate.role === "user" || candidate.role === "assistant")
+        && typeof candidate.content === "string";
+    });
+    return boundCompletedTranscript(messages);
+  } catch {
+    window.sessionStorage.removeItem(TRANSCRIPT_STORAGE_KEY);
+    return [];
+  }
+}
+
+function storeCompletedTranscript(conversationId: string, messages: Message[]): void {
+  try {
+    window.sessionStorage.setItem(
+      TRANSCRIPT_STORAGE_KEY,
+      JSON.stringify({ conversationId, messages: boundCompletedTranscript(messages) }),
+    );
+  } catch {
+    // Browser storage is a best-effort UI cache, never execution authority.
+  }
+}
+
+function boundCompletedTranscript(messages: Message[]): Message[] {
+  const bounded = messages
+    .filter((message) => message.role === "user" || message.role === "assistant")
+    .slice(-MAX_STORED_MESSAGES);
+  while (
+    bounded.length > 0
+    && bounded.reduce((total, message) => total + message.content.length, 0)
+      > MAX_STORED_CHARACTERS
+  ) {
+    bounded.splice(0, 2);
+  }
+  return bounded;
 }

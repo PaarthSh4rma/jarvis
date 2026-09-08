@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     memory_max_project_entries: int = Field(default=25, ge=1, le=250)
     memory_max_characters: int = Field(default=500, ge=50, le=4000)
     memory_max_injected_characters: int = Field(default=2000, ge=100, le=10000)
+    run_timeout_seconds: float = Field(default=90, gt=0, le=600)
+    tool_timeout_seconds: float = Field(default=15, gt=0, le=120)
+    run_terminal_ttl_seconds: int = Field(default=900, ge=30, le=86400)
+    run_max_entries: int = Field(default=100, ge=1, le=1000)
+    run_max_events: int = Field(default=200, ge=10, le=1000)
 
     model_config = SettingsConfigDict(env_prefix="JARVIS_", env_file=".env")
 
