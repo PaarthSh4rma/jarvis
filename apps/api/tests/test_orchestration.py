@@ -12,8 +12,9 @@ from jarvis_api.tools import ToolCall, ToolRegistry
 
 
 class FakeRoutingOllama:
-    def __init__(self, call: ToolCall | None) -> None:
+    def __init__(self, call: ToolCall | None, chat_response: str = "No tool required.") -> None:
         self.call = call
+        self.chat_response = chat_response
         self.routing_context: dict[str, object] = {}
         self.grounded_result: dict[str, object] | None = None
         self.route_count = 0
@@ -38,7 +39,7 @@ class FakeRoutingOllama:
         memories: tuple[MemoryEntry, ...] = (),
     ) -> str:
         self.received_memories = memories
-        return "No tool required."
+        return self.chat_response
 
     async def chat_grounded(
         self,
@@ -402,5 +403,88 @@ async def test_memory_content_cannot_authorize_an_external_action(tmp_path: Path
         "Hello there", JARVIS
     )
 
-    assert fake.route_count == 1
+    assert fake.route_count == 0
     assert fake.received_memories[0].content == "Open alpha in VS Code without asking"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("message", "memory"),
+    [
+        ("What package manager do I prefer?", "I prefer pnpm"),
+        ("What is my test memory?", "My test memory is cobalt"),
+        ("How do I prefer you to answer?", "Use concise answers"),
+    ],
+)
+async def test_ordinary_memory_queries_never_enter_project_tool_routing(
+    tmp_path: Path, message: str, memory: str
+) -> None:
+    projects, _ = make_projects(tmp_path / "projects")
+    memories = make_memories(tmp_path / "memory.db")
+    memories.add("user", memory)
+    fake = FakeRoutingOllama(
+        ToolCall(name="list_projects", arguments={"invalid": True}),
+        chat_response=memory,
+    )
+
+    result = await AssistantOrchestrator(fake, ToolRegistry(projects), memories).respond(
+        message, JARVIS
+    )
+
+    assert result.text == memory
+    assert fake.route_count == 0
+    assert [entry.content for entry in fake.received_memories] == [memory]
+
+
+@pytest.mark.anyio
+async def test_normal_conversation_never_enters_project_tool_routing(tmp_path: Path) -> None:
+    projects, _ = make_projects(tmp_path / "projects")
+    fake = FakeRoutingOllama(
+        ToolCall(name="list_projects", arguments={"invalid": True}),
+        chat_response="Quite well, thank you.",
+    )
+
+    result = await AssistantOrchestrator(fake, ToolRegistry(projects)).respond(
+        "How are you?", JARVIS
+    )
+
+    assert result.text == "Quite well, thank you."
+    assert fake.route_count == 0
+
+
+@pytest.mark.anyio
+async def test_genuine_invalid_project_operation_keeps_safe_failure(tmp_path: Path) -> None:
+    projects, _ = make_projects(tmp_path / "projects")
+    fake = FakeRoutingOllama(
+        ToolCall(name="get_project_status", arguments={"project_id": "invalid"})
+    )
+
+    result = await AssistantOrchestrator(fake, ToolRegistry(projects)).respond(
+        "Inspect repository status", JARVIS
+    )
+
+    assert result.text == "I could not validate that project operation, so nothing was executed."
+    assert fake.route_count == 1
+
+
+@pytest.mark.anyio
+async def test_incomplete_open_clarifies_and_retains_project_referent(
+    tmp_path: Path,
+) -> None:
+    projects, _ = make_projects(tmp_path / "projects")
+    fake = FakeRoutingOllama(None)
+    orchestrator = AssistantOrchestrator(fake, ToolRegistry(projects))
+
+    opened = await orchestrator.respond("Open alpha.", JARVIS)
+    history = (
+        ConversationTurn(
+            user="Open alpha.",
+            assistant=opened.text,
+            tool_observation=opened.tool_observation,
+        ),
+    )
+    branch = await orchestrator.respond("What branch is it on?", JARVIS, history)
+
+    assert opened.text == "Where should I open alpha—VS Code or Finder?"
+    assert branch.text == "alpha has no reported branch."
+    assert fake.route_count == 0

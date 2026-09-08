@@ -60,7 +60,7 @@ Each turn separates user text, assistant text, and an optional compact trusted t
 
 Pronouns and ordinals are resolved only from recent trusted observations. A unique `project` observation resolves `it`; list observations can resolve `first`, `second`, or `third`. Dirty-project follow-ups consider only entries whose authoritative `is_dirty` field is `true`. Missing or multiple referents produce a clarification before Ollama or tools run.
 
-Reference resolution yields an opaque project ID from trusted backend observations or the current discovered-project index. The normal Pydantic tool schema validates it, and the registry resolves it beneath `PROJECTS_ROOT`. Conversation context grants no permissions. An ordinal launch additionally requires explicit current-turn wording naming VS Code or Finder; prior conversation cannot authorise an external action.
+Reference resolution yields an opaque project ID from trusted backend observations or the current discovered-project index. An explicitly named current project takes precedence over a stale conversational referent. A partial explicit descriptor that matches multiple projects clarifies instead of reusing stale context. The normal Pydantic tool schema validates the resolved ID, and the registry resolves it beneath `PROJECTS_ROOT`. Conversation context grants no permissions. An ordinal launch additionally requires explicit current-turn wording naming VS Code or Finder; prior conversation cannot authorise an external action.
 
 ## Persistent memory
 
@@ -69,6 +69,8 @@ Reference resolution yields an opaque project ID from trusted backend observatio
 The bounds are 50 user entries, 25 entries per project, 500 characters per entry, and 2,000 total memory-content characters injected into a prompt. Selection is ordered deterministically by update time then ID; resolved project entries are selected before user entries. Unrelated project entries are never selected. Memory does not consume or weaken the separate 12,000-character short-term session budget.
 
 Chat mutation is deliberately deterministic and requires explicit `remember`, `save this`, `keep this in mind`, `forget`, or `remove memory` language. There is no automatic extraction. REST mutations and chat mutations both pass through the repository's validation and bounds. Common credential/secret markers are rejected. Ambiguous deletion changes nothing.
+
+Ordinary conversation never enters the project-tool router merely because the router exists. Only requests with a project/tool semantic candidate may ask Ollama for a structured project call; unmatched preference, memory-retrieval, and social questions go directly to conversational chat with bounded memory. Consequently, project validation failures are reported only for genuine project-operation attempts. An open request that resolves a project but omits VS Code or Finder asks for the destination and records only the trusted project referent—never launch permission.
 
 Prompt construction keeps personality, bounded memory data, session history, routing, current input, and trusted observations logically separate. Memory sent to Ollama omits memory IDs and project IDs and is labelled untrusted contextual data, never an instruction or authorization. Memory is not sent into tool routing. The enforced precedence is:
 

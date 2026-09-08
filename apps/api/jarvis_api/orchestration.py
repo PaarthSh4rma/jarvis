@@ -12,16 +12,23 @@ EXPLICIT_OPEN_PATTERN = re.compile(
     r"^\s*(?:please\s+)?(?:open|launch|show)\b.*\b(?:vs\s*code|vscode|finder)\b",
     re.IGNORECASE,
 )
+OPEN_INTENT_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?(?:open|launch)\b", re.IGNORECASE
+)
 ORDINAL_PATTERN = re.compile(r"\b(first|1st|second|2nd|third|3rd)\s+(?:one|project)\b", re.I)
 REFERENCE_PATTERN = re.compile(r"\b(it|its|that project|this project|the project)\b", re.I)
 LIST_PROJECTS_PATTERN = re.compile(
     r"\b(?:what|which|list|show)\b.*\bprojects?\b", re.IGNORECASE
 )
 REMEMBER_PATTERN = re.compile(
-    r"\b(?:remember\s+that|save\s+this(?:\s*:)?|keep\s+this\s+in\s+mind(?:\s*:)?)[\s]+(.+)$",
+    r"\b(?:remember\s+(?:that|this\s+exact\s+note\s*:|this\s*:?)|"
+    r"save\s+this(?:\s*:)?|keep\s+this\s+in\s+mind(?:\s*:)?)[\s]+(.+)$",
     re.IGNORECASE,
 )
 PROJECT_MEMORY_INTENT_PATTERN = re.compile(r"^\s*for\s+.+?,\s*remember\b", re.I)
+DESCRIBED_PROJECT_PATTERN = re.compile(
+    r"^\s*for\s+(?:the\s+)?(.+?)\s+project\s*,", re.IGNORECASE
+)
 FORGET_PATTERN = re.compile(
     r"^\s*(?:please\s+)?(?:forget|remove)\s+(?:that\s+|the\s+)?(?:memory\s+)?(?:about\s+)?(.+?)(?:\s+memory)?[.!?]*\s*$",
     re.IGNORECASE,
@@ -30,6 +37,10 @@ LIST_MEMORY_PATTERN = re.compile(r"\b(?:what|list|show)\b.*\bremember|\bmemories
 LIVE_PROJECT_FIELD_PATTERN = re.compile(
     r"\b(branch|updated|update|commit(?:ted)?|technology|technologies|stack|language|dirty|uncommitted|status)\b",
     re.I,
+)
+PROJECT_TOOL_CANDIDATE_PATTERN = re.compile(
+    r"\b(?:project|projects|repo|repos|repository|repositories)\b",
+    re.IGNORECASE,
 )
 ORDINAL_INDEX = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2}
 
@@ -61,13 +72,14 @@ class AssistantOrchestrator:
         assistant: Assistant,
         history: tuple[ConversationTurn, ...] = (),
     ) -> AssistantResult:
-        reference = self._resolve_reference(message, history)
+        routing_context = self.tools.routing_context()
+        reference = self._resolve_explicit_project(message, routing_context)
+        if reference.project_id is None and not reference.ambiguous:
+            reference = self._resolve_reference(message, history)
         if reference.ambiguous:
             return AssistantResult(
                 "Which project do you mean? I do not have one unambiguous project reference."
             )
-
-        routing_context = self.tools.routing_context()
         if reference.project_id is None:
             reference = self._resolve_named_project(message, routing_context)
         if reference.project_id:
@@ -81,9 +93,14 @@ class AssistantOrchestrator:
             return memory_result
         memory_context = self._memory_context(reference.project_id)
         call = self._deterministic_tool(message, reference)
-        if call is None and reference.project_id and memory_context:
-            return AssistantResult(await self._chat(message, assistant, history, memory_context))
-        if call is None:
+        if call is None and OPEN_INTENT_PATTERN.search(message):
+            if reference.project_id:
+                return AssistantResult(
+                    f"Where should I open {reference.project_name}—VS Code or Finder?",
+                    self._project_reference_observation(reference),
+                )
+            return AssistantResult("Which project should I open, and in VS Code or Finder?")
+        if call is None and self._is_project_tool_candidate(message, reference):
             call = await self.ollama.route_tool(message, assistant, routing_context, history)
         if call is None:
             return AssistantResult(await self._chat(message, assistant, history, memory_context))
@@ -102,6 +119,29 @@ class AssistantOrchestrator:
             )
         response = self._format_grounded_response(message, call.name, result)
         return AssistantResult(response, self._compact_observation(call.name, result))
+
+    @staticmethod
+    def _is_project_tool_candidate(
+        message: str, reference: ReferenceResolution
+    ) -> bool:
+        return bool(
+            PROJECT_TOOL_CANDIDATE_PATTERN.search(message)
+            or (reference.project_id and LIVE_PROJECT_FIELD_PATTERN.search(message))
+        )
+
+    @staticmethod
+    def _project_reference_observation(
+        reference: ReferenceResolution,
+    ) -> dict[str, object]:
+        return {
+            "tool": "resolve_project",
+            "result": {
+                "project": {
+                    "id": reference.project_id,
+                    "name": reference.project_name,
+                }
+            },
+        }
 
     @staticmethod
     def _deterministic_tool(
@@ -276,6 +316,33 @@ class AssistantOrchestrator:
         ]
         if len(matches) != 1:
             return ReferenceResolution()
+        project = matches[0]
+        return ReferenceResolution(str(project["id"]), str(project["name"]))
+
+    @classmethod
+    def _resolve_explicit_project(
+        cls, message: str, routing_context: dict[str, object]
+    ) -> ReferenceResolution:
+        named = cls._resolve_named_project(message, routing_context)
+        if named.project_id:
+            return named
+        descriptor = DESCRIBED_PROJECT_PATTERN.search(message)
+        if descriptor is None or descriptor.group(1).casefold() in {"this", "the"}:
+            return ReferenceResolution()
+        terms = re.findall(r"[a-z0-9]+", descriptor.group(1).casefold())
+        projects = routing_context.get("projects")
+        if not terms or not isinstance(projects, list):
+            return ReferenceResolution(ambiguous=True)
+        matches = [
+            project
+            for project in projects
+            if isinstance(project, dict)
+            and isinstance(project.get("id"), str)
+            and isinstance(project.get("name"), str)
+            and all(term in str(project["name"]).casefold() for term in terms)
+        ]
+        if len(matches) != 1:
+            return ReferenceResolution(ambiguous=True)
         project = matches[0]
         return ReferenceResolution(str(project["id"]), str(project["name"]))
 

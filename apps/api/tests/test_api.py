@@ -6,6 +6,7 @@ from sqlalchemy.pool import StaticPool
 
 from jarvis_api.assistants import Assistant
 from jarvis_api.conversations import ConversationStore, ConversationTurn
+from jarvis_api.database import create_database_engine
 from jarvis_api.main import (
     app,
     get_conversation_store,
@@ -35,6 +36,8 @@ class FakeOllama:
         self.tool_call = tool_call
         self.grounded_result: dict[str, object] | None = None
         self.received_history: tuple[ConversationTurn, ...] = ()
+        self.received_memories = ()
+        self.route_count = 0
 
     async def is_available(self) -> bool:
         return self.available
@@ -44,10 +47,12 @@ class FakeOllama:
         message: str,
         assistant: Assistant,
         history: tuple[ConversationTurn, ...] = (),
+        memories: tuple = (),
     ) -> str:
         self.received_message = message
         self.received_assistant = assistant
         self.received_history = history
+        self.received_memories = memories
         if not self.available:
             raise OllamaUnavailableError("offline")
         return self.response
@@ -59,6 +64,7 @@ class FakeOllama:
         routing_context: dict[str, object],
         history: tuple[ConversationTurn, ...] = (),
     ) -> ToolCall | None:
+        self.route_count += 1
         if not self.available:
             raise OllamaUnavailableError("offline")
         return self.tool_call
@@ -338,3 +344,102 @@ def test_memory_api_rejects_invalid_project_and_bounds(tmp_path: Path) -> None:
     assert unknown.status_code == 404
     assert malformed.status_code == 422
     assert oversized.status_code == 409
+
+
+def test_http_memory_retrieval_bypasses_invented_project_tool_calls(
+    tmp_path: Path,
+) -> None:
+    fake = FakeOllama(
+        response="You prefer pnpm.",
+        tool_call=ToolCall(name="get_project_status", arguments={"project_id": "invalid"}),
+    )
+    with client_for(fake, tmp_path) as client:
+        first_session = create_conversation(client)
+        saved = client.post(
+            "/chat",
+            json={
+                "message": "Remember that I prefer pnpm.",
+                "conversation_id": first_session,
+            },
+        )
+        fresh_session = create_conversation(client)
+        retrieved = client.post(
+            "/chat",
+            json={
+                "message": "What package manager do I prefer?",
+                "conversation_id": fresh_session,
+            },
+        )
+
+    assert saved.json()["response"] == "Remembered for user: I prefer pnpm."
+    assert retrieved.json()["response"] == "You prefer pnpm."
+    assert [entry.content for entry in fake.received_memories] == ["I prefer pnpm"]
+    assert fake.route_count == 0
+
+
+def test_http_memory_survives_store_reinstantiation_and_backend_session_reset(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'persistent.db'}"
+    first_store = MemoryStore(create_database_engine(database_url))
+    first_store.initialize()
+    with client_for(FakeOllama(), tmp_path, memories=first_store) as client:
+        session = create_conversation(client)
+        client.post(
+            "/chat",
+            json={
+                "message": "Remember that I prefer pnpm.",
+                "conversation_id": session,
+            },
+        )
+
+    second_store = MemoryStore(create_database_engine(database_url))
+    second_store.initialize()
+    fake = FakeOllama(response="pnpm.")
+    with client_for(fake, tmp_path, memories=second_store) as client:
+        fresh_session = create_conversation(client)
+        response = client.post(
+            "/chat",
+            json={
+                "message": "What package manager do I prefer?",
+                "conversation_id": fresh_session,
+            },
+        )
+
+    assert response.json()["response"] == "pnpm."
+    assert [entry.content for entry in fake.received_memories] == ["I prefer pnpm"]
+
+
+def test_http_ordinary_conversation_never_falls_into_project_validation(
+    tmp_path: Path,
+) -> None:
+    fake = FakeOllama(
+        response="Quite well, thank you.",
+        tool_call=ToolCall(name="list_projects", arguments={"unexpected": True}),
+    )
+    with client_for(fake, tmp_path) as client:
+        session = create_conversation(client)
+        response = client.post(
+            "/chat", json={"message": "How are you?", "conversation_id": session}
+        )
+
+    assert response.json()["response"] == "Quite well, thank you."
+    assert fake.route_count == 0
+
+
+def test_http_non_explicit_statement_is_not_persisted(tmp_path: Path) -> None:
+    memory = MemoryStore(create_database_engine(f"sqlite:///{tmp_path / 'memory.db'}"))
+    memory.initialize()
+    with client_for(FakeOllama(response="Noted."), tmp_path, memories=memory) as client:
+        session = create_conversation(client)
+        client.post(
+            "/chat",
+            json={"message": "I used yarn yesterday.", "conversation_id": session},
+        )
+        fresh_session = create_conversation(client)
+        client.post(
+            "/chat",
+            json={"message": "What package manager do I use?", "conversation_id": fresh_session},
+        )
+
+    assert memory.list() == []
