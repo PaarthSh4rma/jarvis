@@ -79,6 +79,8 @@ npm run dev:web
 
 Open [http://localhost:3000](http://localhost:3000). The dashboard reports API and Ollama health independently. Messages travel only from the browser to FastAPI and from FastAPI to local Ollama; the browser never receives a general Ollama proxy.
 
+The project index is live backend state: the dashboard requests `/projects` on every mount or refresh and never treats browser storage as its source of truth. A temporary failure shows `PROJECT INDEX UNAVAILABLE`; use `RETRY PROJECT INDEX` to fetch it again without changing the conversation session or restored transcript.
+
 If Ollama is stopped or the model is missing, the API remains healthy and reports the conversational runtime as offline. Chat requests return a controlled error rather than crashing the application.
 
 Project-aware examples:

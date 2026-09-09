@@ -127,6 +127,31 @@ describe("Dashboard", () => {
     expect(screen.getByText("2")).toBeInTheDocument();
   });
 
+  it("replaces project loading state after a successful initial fetch", async () => {
+    let resolveProjects!: (value: ReturnType<typeof jsonResponse>) => void;
+    const pendingProjects = new Promise<ReturnType<typeof jsonResponse>>((resolve) => {
+      resolveProjects = resolve;
+    });
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      if (url.endsWith("/health")) return Promise.resolve(jsonResponse(onlineHealth));
+      if (url.endsWith("/projects")) return pendingProjects;
+      return Promise.resolve(jsonResponse({ memories: [], max_characters: 500 }));
+    }));
+    render(<Dashboard />);
+
+    expect(screen.getByText("PROJECT INDEX SYNCHRONISING")).toBeInTheDocument();
+    resolveProjects(jsonResponse({
+      projects: [],
+      recent_projects: [{ id: "project", name: "RecoveredProject", branch: "main", is_git_repository: true, is_dirty: false, latest_commit_message: null, latest_commit_timestamp: null, technologies: [] }],
+      count: 1,
+      dirty_count: 0,
+    }));
+
+    await waitFor(() => expect(screen.getByText("RecoveredProject")).toBeInTheDocument());
+    expect(screen.queryByText("PROJECT INDEX SYNCHRONISING")).not.toBeInTheDocument();
+    expect(screen.queryByText("PROJECT INDEX UNAVAILABLE")).not.toBeInTheDocument();
+  });
+
   it("reports project API failure without affecting chat health", async () => {
     vi.stubGlobal("fetch", vi.fn((url: string) => url.endsWith("/health")
       ? Promise.resolve(jsonResponse(onlineHealth))
@@ -135,6 +160,46 @@ describe("Dashboard", () => {
 
     await waitFor(() => expect(screen.getByText("PROJECT INDEX UNAVAILABLE")).toBeInTheDocument());
     expect(screen.getAllByText("ONLINE").length).toBeGreaterThan(0);
+  });
+
+  it("recovers a failed project index through an authoritative backend retry", async () => {
+    let projectAttempts = 0;
+    let resolveRetry!: (value: ReturnType<typeof jsonResponse>) => void;
+    const retryResponse = new Promise<ReturnType<typeof jsonResponse>>((resolve) => {
+      resolveRetry = resolve;
+    });
+    const recovered = {
+      projects: [],
+      recent_projects: [{ id: "recovered", name: "RecoveredProject", branch: "main", is_git_repository: true, is_dirty: false, latest_commit_message: null, latest_commit_timestamp: null, technologies: [] }],
+      count: 1,
+      dirty_count: 0,
+    };
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      if (url.endsWith("/health")) return Promise.resolve(jsonResponse(onlineHealth));
+      if (url.endsWith("/projects")) {
+        projectAttempts += 1;
+        return Promise.resolve(projectAttempts === 1
+          ? jsonResponse({ detail: "temporary" }, false, 500)
+          : retryResponse);
+      }
+      return Promise.resolve(jsonResponse({ memories: [], max_characters: 500 }));
+    }));
+    render(<Dashboard />);
+
+    const status = await screen.findByRole("status");
+    const retry = screen.getByRole("button", { name: "RETRY PROJECT INDEX" });
+    expect(status).toHaveTextContent("PROJECT INDEX UNAVAILABLE");
+    expect(status.querySelector("p")).toHaveTextContent("PROJECT INDEX UNAVAILABLE");
+    expect(status.querySelector("p")).not.toContainElement(retry);
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+    const retrying = await screen.findByRole("button", { name: "RETRYING PROJECT INDEX" });
+    expect(retrying).toBeDisabled();
+    resolveRetry(jsonResponse(recovered));
+
+    await waitFor(() => expect(screen.getByText("RecoveredProject")).toBeInTheDocument());
+    expect(screen.queryByText("PROJECT INDEX UNAVAILABLE")).not.toBeInTheDocument();
+    expect(projectAttempts).toBe(2);
   });
 
   it("reuses the locally retained session for subsequent chat", async () => {
@@ -328,6 +393,8 @@ describe("Dashboard", () => {
     expect(screen.getAllByText("Persisted response.")).toHaveLength(1);
     expect(window.localStorage.getItem("jarvis.conversation-id")).toBe(SESSION_ID);
     expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/runs"))).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/projects"))).toHaveLength(2);
+    expect(screen.queryByText("PROJECT INDEX UNAVAILABLE")).not.toBeInTheDocument();
   });
 
   it("detaches an active stream on refresh without creating another run", async () => {

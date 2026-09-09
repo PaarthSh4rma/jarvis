@@ -50,6 +50,8 @@ SQLite lives under the repository-local `data` directory by default and is exclu
 
 The API is the intended boundary for persistence, model access, tools, and integrations. UI components should not reach Ollama, SQLite, or third-party services directly.
 
+Project discovery is never persisted in browser storage. The dashboard maintains explicit loading, available, and unavailable states, fetches `/projects` on each mount, and can retry a failed request. A successful response atomically replaces stale project data and clears the unavailable state independently of conversation restoration.
+
 ## Assistant and conversation boundaries
 
 Assistant definitions live in `jarvis_api/assistants.py`, separate from transport and routes. The registry currently contains JARVIS and can accept another personality, such as FRIDAY, without changing the Ollama service. Codex is explicitly described as a separate future coding specialist and is never used as the conversational model.

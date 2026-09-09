@@ -1,7 +1,7 @@
 import hashlib
 import subprocess
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -34,6 +34,22 @@ class ProjectMetadata:
     latest_commit_message: str | None
     latest_commit_timestamp: str | None
     technologies: tuple[str, ...]
+    latest_commit_at: datetime | None = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Normalize external Git timestamps once, at metadata construction."""
+        parsed: datetime | None = None
+        if self.latest_commit_timestamp:
+            try:
+                parsed = datetime.fromisoformat(self.latest_commit_timestamp)
+            except ValueError:
+                pass
+        if parsed is not None:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            else:
+                parsed = parsed.astimezone(UTC)
+        object.__setattr__(self, "latest_commit_at", parsed)
 
     def public_dict(self) -> dict[str, object]:
         return {
@@ -78,15 +94,15 @@ class ProjectService:
         return project
 
     def recent(self, limit: int = 5) -> list[ProjectMetadata]:
-        def timestamp(project: ProjectMetadata) -> datetime:
-            if not project.latest_commit_timestamp:
-                return datetime.min
-            try:
-                return datetime.fromisoformat(project.latest_commit_timestamp)
-            except ValueError:
-                return datetime.min
-
-        return sorted(self.discover(), key=timestamp, reverse=True)[:limit]
+        no_timestamp = datetime.min.replace(tzinfo=UTC)
+        projects = sorted(
+            self.discover(), key=lambda project: (project.name.casefold(), project.id)
+        )
+        return sorted(
+            projects,
+            key=lambda project: project.latest_commit_at or no_timestamp,
+            reverse=True,
+        )[:limit]
 
     def open_project(self, project_id: str, target: Literal["vscode", "finder"]) -> None:
         project = self.get(project_id)

@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUp, Braces, CircleDot, Cpu, FolderGit2, Github, Radio, RotateCcw, ShieldCheck, Square, TerminalSquare } from "lucide-react";
 import { ApiError, cancelRun, createConversation, createRun, deleteConversation, getHealth, getProjects, streamRun, type HealthResponse, type ProjectsResponse, type RunEvent } from "@/lib/api";
 import { MemoryPanel } from "@/components/memory-panel";
@@ -21,6 +21,7 @@ export function Dashboard() {
   const [sending, setSending] = useState(false);
   const [projects, setProjects] = useState<ProjectsResponse | null>(null);
   const [projectsUnavailable, setProjectsUnavailable] = useState(false);
+  const [projectsLoading, setProjectsLoading] = useState(true);
   const [conversationId, setConversationId] = useState<string | null>(() =>
     typeof window === "undefined" ? null : window.localStorage.getItem(SESSION_STORAGE_KEY),
   );
@@ -35,6 +36,20 @@ export function Dashboard() {
     setMessages(restored);
   }, []);
 
+  const loadProjects = useCallback(async (signal?: AbortSignal) => {
+    setProjectsLoading(true);
+    try {
+      const discovered = await getProjects(signal);
+      if (signal?.aborted) return;
+      setProjects(discovered);
+      setProjectsUnavailable(false);
+    } catch {
+      if (!signal?.aborted) setProjectsUnavailable(true);
+    } finally {
+      if (!signal?.aborted) setProjectsLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     const controller = new AbortController();
     getHealth(controller.signal)
@@ -42,16 +57,12 @@ export function Dashboard() {
       .catch(() => {
         if (!controller.signal.aborted) setConnection({ state: "offline" });
       });
-    getProjects(controller.signal)
-      .then(setProjects)
-      .catch(() => {
-        if (!controller.signal.aborted) setProjectsUnavailable(true);
-      });
+    void loadProjects(controller.signal);
     return () => {
       controller.abort();
       streamController.current?.abort();
     };
-  }, []);
+  }, [loadProjects]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -242,7 +253,14 @@ export function Dashboard() {
       <section className="projects" aria-labelledby="projects-title">
         <div className="section-label"><span>03</span><h2 id="projects-title">PROJECTS</h2><i /></div>
         {projectsUnavailable ? (
-          <div className="project-empty">PROJECT INDEX UNAVAILABLE</div>
+          <div className="project-empty project-unavailable" role="status">
+            <p>PROJECT INDEX UNAVAILABLE</p>
+            <button type="button" onClick={() => void loadProjects()} disabled={projectsLoading}>
+              {projectsLoading ? "RETRYING PROJECT INDEX" : "RETRY PROJECT INDEX"}
+            </button>
+          </div>
+        ) : projectsLoading && !projects ? (
+          <div className="project-empty">PROJECT INDEX SYNCHRONISING</div>
         ) : (
           <div className="project-console">
             <div className="project-metric"><FolderGit2 size={18} /><span>DISCOVERED</span><strong>{projects?.count ?? "—"}</strong></div>
