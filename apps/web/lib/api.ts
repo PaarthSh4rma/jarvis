@@ -4,6 +4,7 @@ export type HealthResponse = {
   version: string;
   ollama: "online" | "offline";
   model: string;
+  demo_mode: boolean;
 };
 
 export type ChatResponse = {
@@ -52,6 +53,18 @@ export type ProjectsResponse = {
   recent_projects: Project[];
   count: number;
   dirty_count: number;
+};
+
+export type Skill = {
+  name: string;
+  description: string;
+  scope: "project";
+  version: number;
+};
+
+export type SkillsResponse = {
+  skills: Skill[];
+  count: number;
 };
 
 export type MemoryScope = "user" | "project";
@@ -106,10 +119,11 @@ export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
     typeof data.version !== "string" ||
     !["online", "offline"].includes(data.ollama ?? "") ||
     typeof data.model !== "string"
+    || (data.demo_mode !== undefined && typeof data.demo_mode !== "boolean")
   ) {
     throw new Error("Invalid health response");
   }
-  return data as HealthResponse;
+  return { ...data, demo_mode: data.demo_mode ?? false } as HealthResponse;
 }
 
 export async function createConversation(signal?: AbortSignal): Promise<ConversationResponse> {
@@ -242,6 +256,16 @@ export async function getProjects(signal?: AbortSignal): Promise<ProjectsRespons
     throw new ApiError("The project index returned an invalid response.");
   }
   return data as ProjectsResponse;
+}
+
+export async function getSkills(signal?: AbortSignal): Promise<SkillsResponse> {
+  const response = await fetch(`${getApiUrl()}/skills`, { cache: "no-store", signal });
+  if (!response.ok) throw new ApiError("Skill registry is unavailable.", response.status);
+  const data = (await response.json()) as Partial<SkillsResponse>;
+  if (!Array.isArray(data.skills) || typeof data.count !== "number") {
+    throw new ApiError("The skill registry returned an invalid response.");
+  }
+  return data as SkillsResponse;
 }
 
 export async function getMemory(

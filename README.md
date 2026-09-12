@@ -1,6 +1,6 @@
 # JARVIS
 
-A local-first personal assistant and developer command centre. V0.6 adds a bounded execution lifecycle, progressive local Ollama responses, observable tool progress, cancellation, and deterministic timeouts.
+A local-first personal assistant and developer command centre. V0.7 adds a bounded declarative skills registry while preserving the validated V0.6 execution runtime.
 
 ## Prerequisites
 
@@ -47,6 +47,7 @@ The default configuration is:
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=llama3.2:3b
 PROJECTS_ROOT=/Users/your-name/Developer
+SKILLS_ROOT=./skills
 CONVERSATION_TTL_SECONDS=1800
 CONVERSATION_MAX_TURNS=12
 CONVERSATION_MAX_CHARACTERS=12000
@@ -79,6 +80,46 @@ npm run dev:web
 
 Open [http://localhost:3000](http://localhost:3000). The dashboard reports API and Ollama health independently. Messages travel only from the browser to FastAPI and from FastAPI to local Ollama; the browser never receives a general Ollama proxy.
 
+## Record the trusted-reference demo
+
+The public demo fixture is opt-in and isolated under ignored `.demo/` state. It creates
+three real, clean Git repositories—RaceBrain, ExoHunter, and ClientOps Copilot—and sends
+them through the normal project discovery, trusted-observation, reference-resolution,
+tool-validation, and run-event paths. Demo mode never replaces assistant text in the
+frontend and never changes behavior when `JARVIS_DEMO_MODE` is false.
+
+For a manual recording, run these in separate terminals:
+
+```bash
+npm run demo:setup
+npm run demo:api
+```
+
+```bash
+npm run demo:web
+```
+
+Open [http://localhost:3100](http://localhost:3100), start a new session, and enter the
+four prompts shown below. Demo mode treats an explicit bare `open` request as an approved
+open in VS Code for the isolated fixture; normal mode still requires the user to name VS
+Code or Finder.
+
+```text
+what projects am I working on?
+open the second one
+is it clean?
+open the other one
+```
+
+To run the same flow in Playwright and save a 1280×720 WebM recording:
+
+```bash
+npx playwright install chromium  # first run only
+npm run demo:record
+```
+
+Recordings are written beneath `demo-output/playwright/`, which is ignored by Git.
+
 The project index is live backend state: the dashboard requests `/projects` on every mount or refresh and never treats browser storage as its source of truth. A temporary failure shows `PROJECT INDEX UNAVAILABLE`; use `RETRY PROJECT INDEX` to fetch it again without changing the conversation session or restored transcript.
 
 If Ollama is stopped or the model is missing, the API remains healthy and reports the conversational runtime as offline. Chat requests return a controlled error rather than crashing the application.
@@ -89,6 +130,8 @@ Project-aware examples:
 - `Which projects have uncommitted changes?`
 - `What branch is jarvis on?`
 - `Open jarvis in VS Code.`
+- `Sanity check jarvis.`
+- `Use project-summary on jarvis.`
 
 Opening a project is the only action in V0.3. It supports VS Code and Finder, requires explicit wording, and always resolves the target from the discovered project index.
 
@@ -117,7 +160,7 @@ The dashboard's compact `MEMORY` section switches between `USER MEMORY` and `PRO
 
 Defaults are 50 user entries, 25 entries per project, 500 characters per entry, and 2,000 injected memory characters. Project memory is injected only when the current request resolves that project unambiguously. Selection is deterministic and remains separate from the 12,000-character session bound.
 
-Memory is contextual data, not authority. Precedence is `LIVE TRUSTED OBSERVATION > EXPLICIT CURRENT USER STATEMENT > PERSISTED MEMORY > MODEL INFERENCE`. Stored text cannot grant tool permission, change configured roots, override path validation, or supersede a current Git observation. Memory is clearly labelled as untrusted data in the model context, including text that resembles instructions. Entries containing common credential markers such as passwords, API keys, access tokens, secrets, or private keys are rejected; memory is not a secret store.
+Memory is contextual data, not authority. Contextual precedence is `LIVE TRUSTED OBSERVATION > EXPLICIT CURRENT USER STATEMENT > PERSISTED MEMORY > SELECTED SKILL PROCEDURE > MODEL INFERENCE`. Stored text cannot grant tool permission, change configured roots, override path validation, or supersede a current Git observation. Memory is clearly labelled as untrusted data in the model context, including text that resembles instructions. Entries containing common credential markers such as passwords, API keys, access tokens, secrets, or private keys are rejected; memory is not a secret store.
 
 ### Execution runtime
 
@@ -129,7 +172,36 @@ Cancellation is best-effort. Ollama HTTP work is cancelled with its task. A sync
 
 Cancellation and timeout races use a first-terminal-outcome policy: whichever transition is accepted first wins, and every later terminal transition or output event is ignored or rejected. A validated cancellation request signals the execution task and atomically records `CANCELLING` then `CANCELLED`, including when cancellation arrives before the task starts. The 12,000-character Ollama stream ceiling is fail-closed; oversized output produces `FAILED`, and no partial response is committed to conversation history.
 
-V0.6 has no embeddings, RAG, vector database, semantic search, autonomous memory extraction, conversation summarisation, skills, delegation, schedulers, or external agent framework.
+### Declarative skills
+
+A skill is repository-authored procedural guidance: it describes how JARVIS should approach a reusable task. It is not a tool, permission, executable file, autonomous agent, persistent memory, or hidden authority. V0.7 skills cannot run shell or Python, select arbitrary paths, create other skills, write memory automatically, or bypass validated tools.
+
+Skills live beneath the configured trusted `SKILLS_ROOT` as one `SKILL.md` per directory. The small frontmatter schema is:
+
+```markdown
+---
+name: project-health-check
+description: Assess a project's current development health without modifying it.
+scope: project
+version: 1
+---
+
+# Project Health Check
+
+Bounded procedural guidance follows here.
+```
+
+The registry accepts lowercase ASCII names containing digits and internal hyphens, project scope, versions 1–999, descriptions up to 180 characters, and procedures up to 8,000 characters. V0.7 deliberately supports only project-scoped skills; a later milestone may define user-scoped procedures when they have a concrete validated capability. The registry reads at most 12 skills, 12,288 bytes each, from immediate trusted-root child directories. Duplicate names, malformed metadata, invalid UTF-8, and canonical or symlink escapes fail closed. The compact selection index is capped at 3,000 characters, and only one skill may be selected per run.
+
+Explicit invocation such as `Use project-health-check on JARVIS` resolves the exact registered name deterministically. Natural procedural requests use Ollama only to choose from the compact safe metadata index; the backend revalidates the answer and rejects invented names, paths, malformed JSON, and multiple selections. Ordinary conversation does not enter selection unless it contains a bounded procedural intent and an already-resolved project.
+
+Progressive disclosure keeps every full procedure out of the general prompt. Only the selected procedure is added as a separately labelled context layer after selection. Project-scoped skills then resolve exactly one opaque project ID and use the existing `get_project_status` tool. Skill text never chooses executable functions. The initial registry contains `project-health-check` and `project-summary`; `inspect-project` was omitted because the existing read-only capability would make it indistinguishable from these two.
+
+The dashboard fetches safe skill metadata from `GET /skills` on every mount. It exposes loading, available, unavailable, and retry states without storing the registry as browser authority. Runs may emit bounded `skill.selected`, `skill.started`, `skill.completed`, and `skill.failed` events; procedure text, paths, prompts, and tool arguments never enter SSE.
+
+Skills inherit the existing one-run-per-conversation, cancellation, timeout, first-terminal-state, and late-result rules. They can receive bounded memory context, but neither skill text nor memory can authorise an action or create persistent memory. Context precedence is `LIVE TRUSTED OBSERVATION > EXPLICIT CURRENT USER STATEMENT > PERSISTED MEMORY > SELECTED SKILL PROCEDURE > MODEL INFERENCE`; tool authorization remains a separate backend decision.
+
+Known V0.7 limitations: skills are local and repository-authored, only one skill is selected per run, both starter skills are project-scoped and read-only, natural selection depends on the configured local Ollama model, and detached active runs are not resumed after refresh. There is no composition, automatic creation/editing, marketplace, execution history, semantic search, Codex delegation, MCP, browser automation, scheduler, or voice support.
 
 ## Project security model
 

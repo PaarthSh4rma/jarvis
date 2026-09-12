@@ -1,14 +1,25 @@
 {
   "name": "jarvis",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
-  "workspaces": ["apps/web"],
+  "workspaces": [
+    "apps/web"
+  ],
   "scripts": {
+    "demo:setup": "python3 scripts/demo_fixture.py",
+    "demo:api": "JARVIS_DEMO_MODE=true JARVIS_CORS_ORIGINS=http://localhost:3100 PROJECTS_ROOT=.demo/projects apps/api/.venv/bin/uvicorn jarvis_api.main:app --app-dir apps/api --port 8100",
+    "demo:web": "JARVIS_DEMO_MODE=true NEXT_PUBLIC_API_URL=http://localhost:8100 npm run dev --workspace @jarvis/web -- --port 3100",
+    "demo:record": "playwright test --config=playwright.demo.config.ts",
     "dev:web": "npm run dev --workspace @jarvis/web",
     "build": "npm run build --workspace @jarvis/web",
     "lint": "npm run lint --workspace @jarvis/web",
     "test": "npm run test --workspace @jarvis/web",
     "typecheck": "npm run typecheck --workspace @jarvis/web"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0"
+  }
 }

@@ -17,6 +17,14 @@ const onlineHealth = {
 };
 
 const emptyProjects = { projects: [], recent_projects: [], count: 0, dirty_count: 0 };
+const emptySkills = { skills: [], count: 0 };
+const availableSkills = {
+  skills: [
+    { name: "project-health-check", description: "Assess current project health.", scope: "project", version: 1 },
+    { name: "project-summary", description: "Summarise current project state.", scope: "project", version: 1 },
+  ],
+  count: 2,
+};
 const SESSION_ID = "11111111-1111-4111-8111-111111111111";
 const NEW_SESSION_ID = "22222222-2222-4222-8222-222222222222";
 const conversationResponse = (conversationId = SESSION_ID) => ({
@@ -182,6 +190,7 @@ describe("Dashboard", () => {
           ? jsonResponse({ detail: "temporary" }, false, 500)
           : retryResponse);
       }
+      if (url.endsWith("/skills")) return Promise.resolve(jsonResponse(emptySkills));
       return Promise.resolve(jsonResponse({ memories: [], max_characters: 500 }));
     }));
     render(<Dashboard />);
@@ -200,6 +209,179 @@ describe("Dashboard", () => {
     await waitFor(() => expect(screen.getByText("RecoveredProject")).toBeInTheDocument());
     expect(screen.queryByText("PROJECT INDEX UNAVAILABLE")).not.toBeInTheDocument();
     expect(projectAttempts).toBe(2);
+  });
+
+  it("renders bounded skill metadata without raw procedures", async () => {
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      if (url.endsWith("/health")) return Promise.resolve(jsonResponse(onlineHealth));
+      if (url.endsWith("/projects")) return Promise.resolve(jsonResponse(emptyProjects));
+      if (url.endsWith("/skills")) return Promise.resolve(jsonResponse({
+        ...availableSkills,
+        skills: availableSkills.skills.map((skill) => ({ ...skill, procedure: "HIDDEN GIANT PROCEDURE" })),
+      }));
+      return Promise.resolve(jsonResponse({ memories: [], max_characters: 500 }));
+    }));
+
+    render(<Dashboard />);
+
+    await waitFor(() => expect(screen.getByText("project health check")).toBeInTheDocument());
+    expect(screen.getByText("Assess current project health.")).toBeInTheDocument();
+    expect(screen.getAllByText("project // V1 // READY")).toHaveLength(2);
+    expect(screen.queryByText("HIDDEN GIANT PROCEDURE")).not.toBeInTheDocument();
+  });
+
+  it("shows skill registry loading until the initial authoritative fetch completes", async () => {
+    let resolveSkills!: (value: ReturnType<typeof jsonResponse>) => void;
+    const pending = new Promise<ReturnType<typeof jsonResponse>>((resolve) => {
+      resolveSkills = resolve;
+    });
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      if (url.endsWith("/health")) return Promise.resolve(jsonResponse(onlineHealth));
+      if (url.endsWith("/projects")) return Promise.resolve(jsonResponse(emptyProjects));
+      if (url.endsWith("/skills")) return pending;
+      return Promise.resolve(jsonResponse({ memories: [], max_characters: 500 }));
+    }));
+    render(<Dashboard />);
+
+    expect(screen.getByText("SKILL REGISTRY SYNCHRONISING")).toBeInTheDocument();
+    resolveSkills(jsonResponse(availableSkills));
+
+    await screen.findByText("project health check");
+    expect(screen.queryByText("SKILL REGISTRY SYNCHRONISING")).not.toBeInTheDocument();
+  });
+
+  it("recovers the unavailable skill registry through a disabled authoritative retry", async () => {
+    let attempts = 0;
+    let resolveRetry!: (value: ReturnType<typeof jsonResponse>) => void;
+    const retryResponse = new Promise<ReturnType<typeof jsonResponse>>((resolve) => {
+      resolveRetry = resolve;
+    });
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      if (url.endsWith("/health")) return Promise.resolve(jsonResponse(onlineHealth));
+      if (url.endsWith("/projects")) return Promise.resolve(jsonResponse(emptyProjects));
+      if (url.endsWith("/skills")) {
+        attempts += 1;
+        return Promise.resolve(attempts === 1
+          ? jsonResponse({ detail: "temporary" }, false, 503)
+          : retryResponse);
+      }
+      return Promise.resolve(jsonResponse({ memories: [], max_characters: 500 }));
+    }));
+    render(<Dashboard />);
+
+    await screen.findByText("SKILL REGISTRY UNAVAILABLE");
+    const retry = screen.getByRole("button", { name: "RETRY SKILL REGISTRY" });
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+    expect(await screen.findByRole("button", { name: "RETRYING SKILL REGISTRY" })).toBeDisabled();
+    resolveRetry(jsonResponse(availableSkills));
+
+    await waitFor(() => expect(screen.getByText("project summary")).toBeInTheDocument());
+    expect(screen.queryByText("SKILL REGISTRY UNAVAILABLE")).not.toBeInTheDocument();
+    expect(attempts).toBe(2);
+  });
+
+  it("refetches skills on remount instead of treating browser storage as authority", async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith("/health")) return Promise.resolve(jsonResponse(onlineHealth));
+      if (url.endsWith("/projects")) return Promise.resolve(jsonResponse(emptyProjects));
+      if (url.endsWith("/skills")) return Promise.resolve(jsonResponse(availableSkills));
+      return Promise.resolve(jsonResponse({ memories: [], max_characters: 500 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const first = render(<Dashboard />);
+    await screen.findByText("project health check");
+    first.unmount();
+
+    render(<Dashboard />);
+    await screen.findByText("project health check");
+
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/skills"))).toHaveLength(2);
+  });
+
+  it("restores a completed skill exchange while independently refetching the registry", async () => {
+    window.localStorage.setItem("jarvis.conversation-id", SESSION_ID);
+    window.sessionStorage.setItem("jarvis.completed-transcript.v1", JSON.stringify({
+      conversationId: SESSION_ID,
+      messages: [
+        { id: 1, role: "user", content: "Sanity check ExoHunter." },
+        { id: 2, role: "assistant", content: "ExoHunter is healthy." },
+      ],
+    }));
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith("/health")) return Promise.resolve(jsonResponse(onlineHealth));
+      if (url.endsWith("/projects")) return Promise.resolve(jsonResponse(emptyProjects));
+      if (url.endsWith("/skills")) return Promise.resolve(jsonResponse(availableSkills));
+      return Promise.resolve(jsonResponse({ memories: [], max_characters: 500 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<Dashboard />);
+
+    expect(await screen.findByText("ExoHunter is healthy.")).toBeInTheDocument();
+    expect(await screen.findByText("project health check")).toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/runs"))).toHaveLength(0);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/skills"))).toHaveLength(1);
+  });
+
+  it("renders bounded skill execution progress", async () => {
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith("/health")) return Promise.resolve(jsonResponse(onlineHealth));
+      if (url.endsWith("/projects")) return Promise.resolve(jsonResponse(emptyProjects));
+      if (url.endsWith("/skills")) return Promise.resolve(jsonResponse(availableSkills));
+      if (url.endsWith("/conversations")) return Promise.resolve(jsonResponse(conversationResponse(), true, 201));
+      if (url.endsWith("/runs")) return Promise.resolve(jsonResponse(runResponse(), true, 201));
+      return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamController = controller;
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({ sequence: 1, type: "skill.started", timestamp: "now", data: { skill: "project-health-check", message: "Inspecting ExoHunter" } })}\n\n`,
+          ));
+        },
+      }), { status: 200 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<Dashboard />);
+    await waitFor(() => expect(screen.getAllByText("ONLINE").length).toBeGreaterThan(0));
+    fireEvent.change(screen.getByLabelText("Enter a command"), { target: { value: "Sanity check ExoHunter" } });
+    fireEvent.click(screen.getByLabelText("Send message"));
+
+    await screen.findByText("SKILL // PROJECT HEALTH CHECK // INSPECTING EXOHUNTER");
+    streamController.enqueue(encoder.encode(
+      `data: ${JSON.stringify({ sequence: 2, type: "assistant.delta", timestamp: "now", data: { content: "Healthy." } })}\n\ndata: ${JSON.stringify({ sequence: 3, type: "run.completed", timestamp: "now", data: { state: "COMPLETED" } })}\n\n`,
+    ));
+    streamController.close();
+    await screen.findByText("Healthy.");
+  });
+
+  it("keeps a safe approved-tool result visible in the transcript", async () => {
+    const toolEvents = () => new Response(
+      `data: ${JSON.stringify({ sequence: 1, type: "tool.requested", timestamp: "now", data: { tool: "get_project_status", message: "Inspecting ExoHunter state" } })}\n\n`
+      + `data: ${JSON.stringify({ sequence: 2, type: "tool.completed", timestamp: "now", data: { tool: "get_project_status", message: "Tool completed" } })}\n\n`
+      + `data: ${JSON.stringify({ sequence: 3, type: "assistant.delta", timestamp: "now", data: { content: "ExoHunter has no uncommitted changes." } })}\n\n`
+      + `data: ${JSON.stringify({ sequence: 4, type: "run.completed", timestamp: "now", data: { state: "COMPLETED" } })}\n\n`,
+      { status: 200, headers: { "Content-Type": "text/event-stream" } },
+    );
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      if (url.endsWith("/health")) return Promise.resolve(jsonResponse(onlineHealth));
+      if (url.endsWith("/projects")) return Promise.resolve(jsonResponse(emptyProjects));
+      if (url.endsWith("/skills")) return Promise.resolve(jsonResponse(emptySkills));
+      if (url.endsWith("/conversations")) return Promise.resolve(jsonResponse(conversationResponse(), true, 201));
+      if (url.endsWith("/runs")) return Promise.resolve(jsonResponse(runResponse(), true, 201));
+      if (url.includes("/events?")) return Promise.resolve(toolEvents());
+      return Promise.resolve(jsonResponse({ memories: [], max_characters: 500 }));
+    }));
+    render(<Dashboard />);
+
+    await waitFor(() => expect(screen.getAllByText("ONLINE").length).toBeGreaterThan(0));
+    fireEvent.change(screen.getByLabelText("Enter a command"), { target: { value: "Is it clean?" } });
+    fireEvent.click(screen.getByLabelText("Send message"));
+
+    expect(await screen.findByText("Inspecting ExoHunter state")).toBeInTheDocument();
+    expect(screen.getByText("VERIFIED")).toBeInTheDocument();
+    expect(screen.getByText("ExoHunter has no uncommitted changes.")).toBeInTheDocument();
   });
 
   it("reuses the locally retained session for subsequent chat", async () => {
@@ -397,7 +579,7 @@ describe("Dashboard", () => {
     expect(screen.queryByText("PROJECT INDEX UNAVAILABLE")).not.toBeInTheDocument();
   });
 
-  it("detaches an active stream on refresh without creating another run", async () => {
+  it("detaches an active skill stream on refresh without creating another run", async () => {
     window.localStorage.setItem("jarvis.conversation-id", SESSION_ID);
     const fetchMock = vi.fn((url: string, options?: RequestInit) => {
       if (url.endsWith("/health")) return Promise.resolve(jsonResponse(onlineHealth));
@@ -412,7 +594,7 @@ describe("Dashboard", () => {
     const first = render(<Dashboard />);
 
     await waitFor(() => expect(screen.getAllByText("ONLINE").length).toBeGreaterThan(0));
-    fireEvent.change(screen.getByLabelText("Enter a command"), { target: { value: "Still running" } });
+    fireEvent.change(screen.getByLabelText("Enter a command"), { target: { value: "Use project-health-check on ExoHunter." } });
     fireEvent.click(screen.getByLabelText("Send message"));
     await screen.findByLabelText("Stop execution");
     first.unmount();
@@ -420,7 +602,7 @@ describe("Dashboard", () => {
 
     await waitFor(() => expect(screen.getAllByText("ONLINE").length).toBeGreaterThan(0));
     expect(window.localStorage.getItem("jarvis.conversation-id")).toBe(SESSION_ID);
-    expect(screen.queryByText("Still running")).not.toBeInTheDocument();
+    expect(screen.queryByText("Use project-health-check on ExoHunter.")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("Stop execution")).not.toBeInTheDocument();
     expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/runs"))).toHaveLength(1);
   });

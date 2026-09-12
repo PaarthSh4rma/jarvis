@@ -20,6 +20,7 @@ The implemented cross-surface contracts are:
 - `DELETE /conversations/{conversation_id}`: discard a session and its context.
 - `GET /projects`: safe metadata and aggregate status for discovered projects.
 - `GET /projects/{project_id}`: one project resolved through an opaque server ID.
+- `GET /skills`: safe bounded metadata for repository-authored skills.
 - `GET/POST /memory`: list or add bounded persistent memory.
 - `PATCH/DELETE /memory/{memory_id}`: update or delete one opaque memory entry.
 
@@ -33,7 +34,8 @@ Next.js dashboard -> FastAPI run coordinator -> bounded run store -> SSE events
                                             ^                  |
                                             |                  v
                                      SQLite memory -> bounded untrusted data context
-                                                               -> Ollama router
+                                      trusted skill registry -> bounded selection index
+                                                               -> Ollama routers
                                             |                    |
                                             v                    v
                                    approved project tool <- validated JSON
@@ -46,11 +48,27 @@ Ollama is never called from the browser. The backend selects the configured mode
 
 ## Local-first boundaries
 
-SQLite lives under the repository-local `data` directory by default and is excluded from source control. It stores only explicit persistent memory, not chat transcripts or V0.6 runs. General settings use `JARVIS_` variables; Ollama and project discovery use the explicit `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `PROJECTS_ROOT` variables. Secrets must live only in ignored environment files or a future macOS keychain adapter.
+SQLite lives under the repository-local `data` directory by default and is excluded from source control. It stores only explicit persistent memory, not chat transcripts, runs, or skill history. General settings use `JARVIS_` variables; Ollama, project discovery, and skill discovery use the explicit `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `PROJECTS_ROOT`, and `SKILLS_ROOT` variables. Secrets must live only in ignored environment files or a future macOS keychain adapter.
 
 The API is the intended boundary for persistence, model access, tools, and integrations. UI components should not reach Ollama, SQLite, or third-party services directly.
 
 Project discovery is never persisted in browser storage. The dashboard maintains explicit loading, available, and unavailable states, fetches `/projects` on each mount, and can retry a failed request. A successful response atomically replaces stale project data and clears the unavailable state independently of conversation restoration.
+
+## Isolated demo mode
+
+`JARVIS_DEMO_MODE=true` is an explicit local presentation mode. The accompanying setup
+script owns only ignored `.demo/` state and creates three ordinary Git repositories with
+fixed names, commits, branches, and clean working trees. `DemoProjectService` changes only
+their presentation order; metadata and status still come from `ProjectService` and Git.
+Opaque identifiers, root containment, tool schemas, run ownership, and trusted observation
+rules remain in force.
+
+The demo accepts an explicit bare `open` instruction as permission to use the existing
+allowlisted VS Code target, only for a project already resolved from trusted context. With
+demo mode disabled, the existing destination clarification remains mandatory. The health
+contract exposes the mode so the frontend can use a compact recording layout and permit
+the deterministic demo commands even if Ollama is offline; it continues to display the
+real Ollama status, and non-deterministic conversation still fails safely without Ollama.
 
 ## Assistant and conversation boundaries
 
@@ -80,19 +98,54 @@ Chat mutation is deliberately deterministic and requires explicit `remember`, `s
 
 Ordinary conversation never enters the project-tool router merely because the router exists. Only requests with a project/tool semantic candidate may ask Ollama for a structured project call; unmatched preference, memory-retrieval, and social questions go directly to conversational chat with bounded memory. Consequently, project validation failures are reported only for genuine project-operation attempts. An open request that resolves a project but omits VS Code or Finder asks for the destination and records only the trusted project referent—never launch permission.
 
-Prompt construction keeps personality, bounded memory data, session history, routing, current input, and trusted observations logically separate. Memory sent to Ollama omits memory IDs and project IDs and is labelled untrusted contextual data, never an instruction or authorization. Memory is not sent into tool routing. The enforced precedence is:
+Prompt construction keeps personality, bounded memory data, session history, routing, current input, and trusted observations logically separate. Memory sent to Ollama omits memory IDs and project IDs and is labelled untrusted contextual data, never an instruction or authorization. Memory is not sent into tool routing. The enforced contextual precedence is:
 
 ```text
-LIVE TRUSTED OBSERVATION > EXPLICIT CURRENT USER STATEMENT > PERSISTED MEMORY > MODEL INFERENCE
+LIVE TRUSTED OBSERVATION > EXPLICIT CURRENT USER STATEMENT > PERSISTED MEMORY
+> SELECTED SKILL PROCEDURE > MODEL INFERENCE
 ```
 
-Live project-field questions continue through validated tools and deterministic formatting, so stale memory cannot override Git state. A memory cannot grant launch permission or weaken project/path validation. V0.6 adds no embedding, RAG, vector database, semantic search, autonomous extraction, or agent framework.
+Authorization is separate from contextual precedence. Neither memory nor a selected skill can grant tool permission, weaken project/path validation, or override current Git state.
+
+## Declarative skills
+
+V0.7 keeps knowledge, procedure, and executable capability distinct:
+
+```text
+                    JARVIS
+                  Ollama brain
+                       |
+        +--------------+--------------+
+        |              |              |
+      MEMORY          SKILLS         TOOLS
+   what it knows   how to do it   what it can do
+        |              |              |
+        +--------------+--------------+
+                       |
+                 ORCHESTRATOR
+                       |
+                 V0.6 RUN TIME
+                       |
+                VALIDATED ACTIONS
+```
+
+`SkillRegistry` discovers only immediate child directories beneath canonical `SKILLS_ROOT`, resolving every directory and `SKILL.md` back beneath that root. Definitions have strict `name`, `description`, `scope`, and integer `version` frontmatter followed by Markdown procedure text. Names are lowercase ASCII words separated by hyphens. V0.7 supports only `project` scope; user scope is deferred until it has a concrete validated capability. Duplicate names, additional or missing metadata, invalid scope/version/encoding, escaping symlinks, oversized content, and excessive registry counts reject the registry.
+
+Bounds are 12 skills, 12,288 bytes per file, 64 name characters, 180 description characters, 8,000 procedure characters, a 3,000-character compact selection index, and exactly one selected skill per run. `GET /skills` returns only name, description, scope, and version—never procedure or canonical path. The dashboard re-fetches this authoritative index on mount and exposes loading, unavailable, and retry states.
+
+Selection uses progressive disclosure. Explicit `Use <safe-name>` and `Run <safe-name>` requests resolve directly against the registry. A natural procedural request with one resolved project may ask Ollama to choose an exact name from the compact metadata index. Output shape, name syntax, and registry membership are revalidated; malformed JSON, lists, unknown names, tool-shaped data, and path-like values select nothing. Ordinary conversation does not invoke the selector merely because skills exist. A bounded `How about RaceBrain?` follow-up may reuse the previous skill only after normal project resolution selects the newly named project.
+
+Only the selected procedure is added in a separate system context message. It is labelled as trusted repository-authored procedural guidance, never authorization or factual authority. Unrelated procedures are absent. Memory remains separate untrusted data; skill text cannot turn it into an instruction.
+
+The starter skills are `project-health-check` and `project-summary`. Both are project-scoped, read-only, and map through backend code to the existing validated `get_project_status` tool. Procedure prose is never parsed into function calls, so text requesting shell access, arbitrary paths, application launch, memory mutation, or unknown tools gains no capability. `inspect-project` is omitted because current tools would make it functionally redundant.
+
+Skill execution remains inside `RunExecutor`; there is no competing state machine. Bounded `skill.selected`, `skill.started`, `skill.completed`, and `skill.failed` events carry only a registered name and safe status. Cancellation or timeout removes authority to advance, emit late output, write session history, or complete successfully. Skills may receive already-bounded memory context, but never write memory automatically or store execution history.
 
 ## Execution lifecycle
 
 `RunStore` centrally enforces `QUEUED -> RUNNING`, optional `WAITING_FOR_TOOL`, and exactly one of `COMPLETED`, `FAILED`, `CANCELLED`, or `TIMED_OUT`; cancellation passes through `CANCELLING`. Illegal transitions fail closed. One run may be active per conversation. Runs are process-local and bounded to 100 entries, 200 retained events each, and a 15-minute terminal TTL by default.
 
-The frontend creates a run and reads ordered SSE frames. Events contain state, bounded assistant text deltas, safe tool names, and human-readable action descriptions—never raw arguments, paths, prompts, memory rows, secrets, or model reasoning. Ollama's NDJSON stream is converted into `assistant.delta` events with a 12,000-character output ceiling. The final assembled answer is appended as one conversation turn only after successful completion.
+The frontend creates a run and reads ordered SSE frames. Events contain state, bounded assistant text deltas, safe tool/skill names, and human-readable action descriptions—never raw arguments, paths, prompts, procedures, memory rows, secrets, or model reasoning. Ollama's NDJSON stream is converted into `assistant.delta` events with a 12,000-character output ceiling. The final assembled answer is appended as one conversation turn only after successful completion.
 
 Overall runs and individual tool calls have separate configurable deadlines. Cancellation removes the run's authority to commit a result; late model or synchronous worker results cannot resurrect it. SSE supports a numeric cursor while events remain retained. Browser refresh deliberately detaches the active SSE request and does not persist run identifiers or partial output. The remounted UI restores only the matching session's bounded completed-message snapshot and returns to idle; the backend run continues independently to one terminal state.
 
@@ -132,5 +185,6 @@ Approved tools are `list_projects`, `get_project_status`, `get_recent_project_ac
 - Treat Codex as an explicit specialist tool, not the default conversation provider.
 - Add integrations as isolated adapters with explicit permissions and credential storage.
 - Introduce background jobs only when a real workload requires them.
+- Consider skill composition only after a later milestone defines bounded sequencing and authority rules.
 
-Authentication, hosted infrastructure, transcript history, semantic memory, voice, browser automation, agent frameworks, and external connectors are intentionally outside this milestone.
+Automatic or model-authored skill creation/editing, marketplaces, arbitrary shell/Python execution, Codex delegation, MCP, authentication, hosted infrastructure, transcript history, semantic memory, voice, browser automation, schedulers, agent frameworks, and external connectors are intentionally outside this milestone.

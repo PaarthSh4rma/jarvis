@@ -8,6 +8,7 @@ from jarvis_api.conversations import ConversationTurn
 from jarvis_api.memory import MemoryEntry, MemoryStore
 from jarvis_api.ollama import OllamaService
 from jarvis_api.projects import ProjectNotFoundError
+from jarvis_api.skills import Skill, SkillNotFoundError, SkillRegistry, SkillRegistryError
 from jarvis_api.tools import ToolCall, ToolError, ToolRegistry
 
 EXPLICIT_OPEN_PATTERN = re.compile(
@@ -22,6 +23,7 @@ OPEN_DESTINATION_FOLLOWUP_PATTERN = re.compile(
 )
 ORDINAL_PATTERN = re.compile(r"\b(first|1st|second|2nd|third|3rd)\s+(?:one|project)\b", re.I)
 REFERENCE_PATTERN = re.compile(r"\b(it|its|that project|this project|the project)\b", re.I)
+OTHER_REFERENCE_PATTERN = re.compile(r"\b(?:the\s+)?other\s+one\b", re.I)
 LIST_PROJECTS_PATTERN = re.compile(
     r"\b(?:what|which|list|show)\b.*\bprojects?\b", re.IGNORECASE
 )
@@ -40,13 +42,26 @@ FORGET_PATTERN = re.compile(
 )
 LIST_MEMORY_PATTERN = re.compile(r"\b(?:what|list|show)\b.*\bremember|\bmemories\b", re.I)
 LIVE_PROJECT_FIELD_PATTERN = re.compile(
-    r"\b(branch|updated|update|commit(?:ted)?|technology|technologies|stack|language|dirty|uncommitted|status)\b",
+    r"\b(branch|updated|update|commit(?:ted)?|technology|technologies|stack|language|clean|dirty|uncommitted|status)\b",
     re.I,
 )
 PROJECT_TOOL_CANDIDATE_PATTERN = re.compile(
     r"\b(?:project|projects|repo|repos|repository|repositories)\b",
     re.IGNORECASE,
 )
+EXPLICIT_SKILL_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?(?:use|run)\s+(?:the\s+)?([^\s,]+)", re.IGNORECASE
+)
+AMBIGUOUS_SKILL_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?(?:use|run)\s+(?:a|the)\s+(?:project\s+)?skill\b",
+    re.IGNORECASE,
+)
+NATURAL_SKILL_INTENT_PATTERN = re.compile(
+    r"\b(?:sanity\s+check|health\s+check|how\s+healthy|inspect|take\s+a\s+look|"
+    r"summari[sz]e|summary|what(?:'s|\s+is)\s+going\s+on)\b",
+    re.IGNORECASE,
+)
+SKILL_FOLLOWUP_PATTERN = re.compile(r"^\s*(?:how|what)\s+about\b", re.IGNORECASE)
 ORDINAL_INDEX = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2}
 
 
@@ -61,15 +76,31 @@ class ReferenceResolution:
     project_id: str | None = None
     project_name: str | None = None
     ambiguous: bool = False
+    alternatives: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SkillResolution:
+    skill: Skill | None = None
+    unavailable_name: str | None = None
+    ambiguous: bool = False
+    registry_unavailable: bool = False
 
 
 class AssistantOrchestrator:
     def __init__(
-        self, ollama: OllamaService, tools: ToolRegistry, memories: MemoryStore | None = None
+        self,
+        ollama: OllamaService,
+        tools: ToolRegistry,
+        memories: MemoryStore | None = None,
+        skills: SkillRegistry | None = None,
+        demo_mode: bool = False,
     ) -> None:
         self.ollama = ollama
         self.tools = tools
         self.memories = memories
+        self.skills = skills
+        self.demo_mode = demo_mode
 
     async def respond(
         self,
@@ -93,6 +124,9 @@ class AssistantOrchestrator:
         ):
             reference = self._resolve_latest_unique_project(history)
         if reference.ambiguous:
+            if reference.alternatives:
+                choices = " or ".join(reference.alternatives)
+                return AssistantResult(f"Which project do you mean: {choices}?")
             return AssistantResult(
                 "Which project do you mean? I do not have one unambiguous project reference."
             )
@@ -108,7 +142,31 @@ class AssistantOrchestrator:
         if memory_result is not None:
             return memory_result
         memory_context = self._memory_context(reference.project_id)
-        call = self._deterministic_tool(message, reference)
+        skill_resolution = await self._select_skill(message, assistant, history, reference)
+        if skill_resolution.registry_unavailable:
+            return AssistantResult("The skill registry is unavailable.")
+        if skill_resolution.unavailable_name:
+            return AssistantResult(
+                f"The skill '{skill_resolution.unavailable_name}' is unavailable."
+            )
+        if skill_resolution.ambiguous:
+            return AssistantResult("Which skill do you want me to use?")
+        selected_skill = skill_resolution.skill
+        if (
+            selected_skill is not None
+            and selected_skill.scope == "project"
+            and not reference.project_id
+        ):
+            return AssistantResult("Which project should I use that skill on?")
+
+        call = (
+            ToolCall(
+                name="get_project_status",
+                arguments={"project_id": reference.project_id},
+            )
+            if selected_skill is not None and reference.project_id
+            else self._deterministic_tool(message, reference)
+        )
         if call is None and OPEN_INTENT_PATTERN.search(message):
             if reference.project_id:
                 return AssistantResult(
@@ -132,6 +190,15 @@ class AssistantOrchestrator:
 
         allow_external_actions = self._allows_external_action(message, call, reference)
         try:
+            if selected_skill is not None and progress_handler:
+                progress_handler(
+                    "skill.selected", selected_skill.name, f"Using {selected_skill.name}"
+                )
+                progress_handler(
+                    "skill.started",
+                    selected_skill.name,
+                    f"Running {selected_skill.name} for {reference.project_name}",
+                )
             if progress_handler:
                 description = self._tool_description(call.name, reference.project_name)
                 progress_handler("tool.requested", call.name, description)
@@ -152,13 +219,127 @@ class AssistantOrchestrator:
         except (ToolError, TimeoutError):
             if progress_handler:
                 progress_handler("tool.failed", call.name, "Tool failed safely")
+                if selected_skill is not None:
+                    progress_handler(
+                        "skill.failed", selected_skill.name, "Skill failed safely"
+                    )
             if raise_tool_errors:
                 raise
             return AssistantResult(
                 "I could not validate that project operation, so nothing was executed."
             )
-        response = self._format_grounded_response(message, call.name, result)
+        if selected_skill is not None:
+            try:
+                response = await self._skill_response(
+                    message,
+                    assistant,
+                    history,
+                    memory_context,
+                    selected_skill,
+                    call.name,
+                    result,
+                    delta_handler,
+                )
+            except Exception:
+                if progress_handler:
+                    progress_handler(
+                        "skill.failed", selected_skill.name, "Skill failed safely"
+                    )
+                raise
+            if progress_handler:
+                progress_handler(
+                    "skill.completed", selected_skill.name, "Skill completed"
+                )
+            observation = self._compact_observation(call.name, result)
+            observation["skill"] = selected_skill.name
+            return AssistantResult(response, observation)
+        response = self._format_grounded_response(
+            message, call.name, result, demo_mode=self.demo_mode
+        )
         return AssistantResult(response, self._compact_observation(call.name, result))
+
+    async def _select_skill(
+        self,
+        message: str,
+        assistant: Assistant,
+        history: tuple[ConversationTurn, ...],
+        reference: ReferenceResolution,
+    ) -> SkillResolution:
+        if self.skills is None:
+            return SkillResolution()
+        if AMBIGUOUS_SKILL_PATTERN.search(message):
+            return SkillResolution(ambiguous=True)
+        explicit = EXPLICIT_SKILL_PATTERN.search(message)
+        if explicit:
+            raw_name = explicit.group(1).rstrip(".?!")
+            name = raw_name.casefold()
+            names_skill_explicitly = bool(
+                "-" in name
+                or re.search(rf"\b{re.escape(raw_name)}\s+skill\b", message, re.IGNORECASE)
+            )
+            if names_skill_explicitly:
+                try:
+                    return SkillResolution(skill=self.skills.get(name))
+                except SkillNotFoundError:
+                    return SkillResolution(unavailable_name=name)
+                except SkillRegistryError:
+                    return SkillResolution(registry_unavailable=True)
+
+        if SKILL_FOLLOWUP_PATTERN.search(message):
+            prior_name = self._latest_skill(history)
+            if prior_name:
+                try:
+                    return SkillResolution(skill=self.skills.get(prior_name))
+                except SkillRegistryError:
+                    return SkillResolution(registry_unavailable=True)
+        if not reference.project_id or not NATURAL_SKILL_INTENT_PATTERN.search(message):
+            return SkillResolution()
+        try:
+            index = self.skills.selection_index()
+        except SkillRegistryError:
+            return SkillResolution(registry_unavailable=True)
+        selected_name = await self.ollama.route_skill(message, assistant, index, history)
+        if not isinstance(selected_name, str) or not selected_name:
+            return SkillResolution()
+        try:
+            return SkillResolution(skill=self.skills.get(selected_name))
+        except (SkillNotFoundError, SkillRegistryError):
+            return SkillResolution()
+
+    async def _skill_response(
+        self,
+        message: str,
+        assistant: Assistant,
+        history: tuple[ConversationTurn, ...],
+        memories: tuple[MemoryEntry, ...],
+        skill: Skill,
+        tool_name: str,
+        tool_result: dict[str, object],
+        delta_handler: Callable[[str], Awaitable[None]] | None,
+    ) -> str:
+        if delta_handler is None:
+            return await self.ollama.chat_grounded(
+                message,
+                assistant,
+                tool_name,
+                tool_result,
+                history,
+                memories,
+                skill,
+            )
+        chunks: list[str] = []
+        async for chunk in self.ollama.chat_grounded_stream(
+            message,
+            assistant,
+            tool_name,
+            tool_result,
+            history,
+            memories,
+            skill,
+        ):
+            chunks.append(chunk)
+            await delta_handler(chunk)
+        return "".join(chunks)
 
     @staticmethod
     def _is_project_tool_candidate(
@@ -183,15 +364,16 @@ class AssistantOrchestrator:
             },
         }
 
-    @staticmethod
     def _deterministic_tool(
-        message: str, reference: ReferenceResolution
+        self, message: str, reference: ReferenceResolution
     ) -> ToolCall | None:
         """Route trusted project references and unambiguous list intent without model variance."""
         if reference.project_id:
             normalised = message.casefold().replace(" ", "")
-            if EXPLICIT_OPEN_PATTERN.search(message) or OPEN_DESTINATION_FOLLOWUP_PATTERN.match(
-                message
+            if (
+                EXPLICIT_OPEN_PATTERN.search(message)
+                or OPEN_DESTINATION_FOLLOWUP_PATTERN.match(message)
+                or (self.demo_mode and OPEN_INTENT_PATTERN.search(message))
             ):
                 target = "finder" if "finder" in normalised else "vscode"
                 return ToolCall(
@@ -318,11 +500,18 @@ class AssistantOrchestrator:
         self, message: str, history: tuple[ConversationTurn, ...]
     ) -> ReferenceResolution:
         ordinal = ORDINAL_PATTERN.search(message)
-        has_reference = ordinal is not None or REFERENCE_PATTERN.search(message) is not None
+        other = OTHER_REFERENCE_PATTERN.search(message)
+        has_reference = (
+            ordinal is not None
+            or other is not None
+            or REFERENCE_PATTERN.search(message) is not None
+        )
         if not has_reference:
             return ReferenceResolution()
 
         candidates = self._latest_candidates(history)
+        if other:
+            return self._resolve_other_reference(history)
         if ordinal:
             index = ORDINAL_INDEX[ordinal.group(1).casefold()]
             if index >= len(candidates):
@@ -333,6 +522,36 @@ class AssistantOrchestrator:
             return ReferenceResolution(ambiguous=True)
         project = candidates[0]
         return ReferenceResolution(str(project["id"]), str(project["name"]))
+
+    @classmethod
+    def _resolve_other_reference(
+        cls, history: tuple[ConversationTurn, ...]
+    ) -> ReferenceResolution:
+        selected = cls._latest_candidates(history)
+        selected_ids = {str(item["id"]) for item in selected}
+        for turn in reversed(history):
+            observation = turn.tool_observation or {}
+            result = observation.get("result")
+            projects = result.get("projects") if isinstance(result, dict) else None
+            if not isinstance(projects, list):
+                continue
+            alternatives = [
+                item
+                for item in projects
+                if isinstance(item, dict)
+                and item.get("id")
+                and item.get("name")
+                and str(item["id"]) not in selected_ids
+            ]
+            if len(alternatives) == 1:
+                project = alternatives[0]
+                return ReferenceResolution(str(project["id"]), str(project["name"]))
+            if alternatives:
+                return ReferenceResolution(
+                    ambiguous=True,
+                    alternatives=tuple(str(item["name"]) for item in alternatives),
+                )
+        return ReferenceResolution(ambiguous=True)
 
     @staticmethod
     def _latest_candidates(history: tuple[ConversationTurn, ...]) -> list[dict[str, object]]:
@@ -355,6 +574,15 @@ class AssistantOrchestrator:
                     candidates = [item for item in candidates if item.get("is_dirty") is True]
                 return candidates
         return []
+
+    @staticmethod
+    def _latest_skill(history: tuple[ConversationTurn, ...]) -> str | None:
+        for turn in reversed(history):
+            observation = turn.tool_observation or {}
+            skill = observation.get("skill")
+            if isinstance(skill, str):
+                return skill
+        return None
 
     @staticmethod
     def _resolve_named_project(
@@ -416,9 +644,11 @@ class AssistantOrchestrator:
     def _allows_external_action(
         self, message: str, call: ToolCall, reference: ReferenceResolution
     ) -> bool:
+        explicit_open = bool(EXPLICIT_OPEN_PATTERN.search(message))
+        destination_followup = bool(OPEN_DESTINATION_FOLLOWUP_PATTERN.match(message))
+        demo_open = bool(self.demo_mode and OPEN_INTENT_PATTERN.search(message))
         if call.name != "open_project" or not (
-            EXPLICIT_OPEN_PATTERN.search(message)
-            or OPEN_DESTINATION_FOLLOWUP_PATTERN.match(message)
+            explicit_open or destination_followup or demo_open
         ):
             return False
         project_id = call.arguments.get("project_id")
@@ -430,6 +660,8 @@ class AssistantOrchestrator:
         target_is_named = target_is_named or (
             target == "vscode" and ("vscode" in normalised or "visualstudiocode" in normalised)
         )
+        if demo_open and reference.project_id and target == "vscode":
+            return project_id == reference.project_id
         if reference.project_id:
             return target_is_named and project_id == reference.project_id
         try:
@@ -459,7 +691,11 @@ class AssistantOrchestrator:
 
     @staticmethod
     def _format_grounded_response(
-        message: str, tool_name: str, result: dict[str, object]
+        message: str,
+        tool_name: str,
+        result: dict[str, object],
+        *,
+        demo_mode: bool = False,
     ) -> str:
         """Render approved observations without asking the model to reinterpret fields."""
         if tool_name == "list_projects":
@@ -478,6 +714,10 @@ class AssistantOrchestrator:
             names = [str(item["name"]) for item in projects if isinstance(item, dict)]
             if not names:
                 return "No projects were discovered."
+            if demo_mode:
+                return "Here are your projects:\n" + "\n".join(
+                    f"{index}. {name}" for index, name in enumerate(names, start=1)
+                )
             return "Projects: " + "; ".join(
                 f"{index}. {name}" for index, name in enumerate(names, start=1)
             ) + "."

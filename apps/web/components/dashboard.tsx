@@ -1,12 +1,12 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { ArrowUp, Braces, CircleDot, Cpu, FolderGit2, Github, Radio, RotateCcw, ShieldCheck, Square, TerminalSquare } from "lucide-react";
-import { ApiError, cancelRun, createConversation, createRun, deleteConversation, getHealth, getProjects, streamRun, type HealthResponse, type ProjectsResponse, type RunEvent } from "@/lib/api";
+import { ArrowUp, Braces, Check, CircleDot, Cpu, FolderGit2, Github, Radio, RotateCcw, ShieldCheck, Sparkles, Square, TerminalSquare } from "lucide-react";
+import { ApiError, cancelRun, createConversation, createRun, deleteConversation, getHealth, getProjects, getSkills, streamRun, type HealthResponse, type ProjectsResponse, type RunEvent, type SkillsResponse } from "@/lib/api";
 import { MemoryPanel } from "@/components/memory-panel";
 
 type Connection = { state: "checking" | "online" | "offline"; health?: HealthResponse };
-type Message = { id: number; role: "user" | "assistant" | "error"; content: string };
+type Message = { id: number; role: "user" | "assistant" | "error" | "tool"; content: string; state?: "running" | "completed" | "failed" };
 const SESSION_STORAGE_KEY = "jarvis.conversation-id";
 const TRANSCRIPT_STORAGE_KEY = "jarvis.completed-transcript.v1";
 const MAX_STORED_MESSAGES = 24;
@@ -17,11 +17,15 @@ export function Dashboard() {
   const [command, setCommand] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const completedMessages = useRef<Message[]>([]);
+  const transcriptEnd = useRef<HTMLDivElement | null>(null);
   const streamController = useRef<AbortController | null>(null);
   const [sending, setSending] = useState(false);
   const [projects, setProjects] = useState<ProjectsResponse | null>(null);
   const [projectsUnavailable, setProjectsUnavailable] = useState(false);
   const [projectsLoading, setProjectsLoading] = useState(true);
+  const [skills, setSkills] = useState<SkillsResponse | null>(null);
+  const [skillsUnavailable, setSkillsUnavailable] = useState(false);
+  const [skillsLoading, setSkillsLoading] = useState(true);
   const [conversationId, setConversationId] = useState<string | null>(() =>
     typeof window === "undefined" ? null : window.localStorage.getItem(SESSION_STORAGE_KEY),
   );
@@ -29,12 +33,17 @@ export function Dashboard() {
   const [resetting, setResetting] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [progress, setProgress] = useState("IDLE");
+  const [toolActive, setToolActive] = useState(false);
 
   useEffect(() => {
     const restored = restoreCompletedTranscript(initialConversationId.current);
     completedMessages.current = restored;
     setMessages(restored);
   }, []);
+
+  useEffect(() => {
+    transcriptEnd.current?.scrollIntoView?.({ block: "nearest" });
+  }, [messages, progress]);
 
   const loadProjects = useCallback(async (signal?: AbortSignal) => {
     setProjectsLoading(true);
@@ -50,6 +59,20 @@ export function Dashboard() {
     }
   }, []);
 
+  const loadSkills = useCallback(async (signal?: AbortSignal) => {
+    setSkillsLoading(true);
+    try {
+      const discovered = await getSkills(signal);
+      if (signal?.aborted) return;
+      setSkills(discovered);
+      setSkillsUnavailable(false);
+    } catch {
+      if (!signal?.aborted) setSkillsUnavailable(true);
+    } finally {
+      if (!signal?.aborted) setSkillsLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     const controller = new AbortController();
     getHealth(controller.signal)
@@ -58,11 +81,12 @@ export function Dashboard() {
         if (!controller.signal.aborted) setConnection({ state: "offline" });
       });
     void loadProjects(controller.signal);
+    void loadSkills(controller.signal);
     return () => {
       controller.abort();
       streamController.current?.abort();
     };
-  }, [loadProjects]);
+  }, [loadProjects, loadSkills]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -84,6 +108,8 @@ export function Dashboard() {
       const run = await createRun(message, activeConversationId);
       setActiveRunId(run.run_id);
       const assistantMessageId = Date.now() + 1;
+      const toolMessageId = assistantMessageId - 1;
+      let toolDescription = "Approved local tool";
       let assembledResponse = "";
       let completed = false;
       const controller = new AbortController();
@@ -98,7 +124,23 @@ export function Dashboard() {
               : [...current, { id: assistantMessageId, role: "assistant", content: runEvent.data.content as string }];
           });
         }
-        if (runEvent.type.startsWith("tool.") && typeof runEvent.data.message === "string") setProgress(runEvent.data.message.toUpperCase());
+        if (runEvent.type.startsWith("tool.") && typeof runEvent.data.message === "string") {
+          setProgress(runEvent.data.message.toUpperCase());
+          if (runEvent.type === "tool.requested") {
+            toolDescription = runEvent.data.message;
+            setToolActive(true);
+            setMessages((current) => [...current, { id: toolMessageId, role: "tool", content: toolDescription, state: "running" }]);
+          }
+          if (runEvent.type === "tool.completed" || runEvent.type === "tool.failed") {
+            setMessages((current) => current.map((item) => item.id === toolMessageId
+              ? { ...item, content: toolDescription, state: runEvent.type === "tool.completed" ? "completed" : "failed" }
+              : item));
+          }
+        }
+        if (runEvent.type.startsWith("skill.") && typeof runEvent.data.message === "string") {
+          const skillName = typeof runEvent.data.skill === "string" ? runEvent.data.skill.replaceAll("-", " ").toUpperCase() : "PROCEDURE";
+          setProgress(`SKILL // ${skillName} // ${runEvent.data.message.toUpperCase()}`);
+        }
         if (runEvent.type === "run.started") setProgress("PROCESSING");
         if (runEvent.type === "run.completed") completed = true;
         if (["run.failed", "run.cancelled", "run.timed_out"].includes(runEvent.type)) {
@@ -113,7 +155,7 @@ export function Dashboard() {
           { id: assistantMessageId, role: "assistant", content: assembledResponse },
         ]);
         completedMessages.current = committed;
-        setMessages(committed);
+        setMessages((current) => boundVisibleTranscript(current));
         storeCompletedTranscript(activeConversationId, committed);
       }
     } catch (error) {
@@ -144,6 +186,7 @@ export function Dashboard() {
       }
     } finally {
       setSending(false);
+      setToolActive(false);
       setActiveRunId(null);
       setProgress("IDLE");
       streamController.current = null;
@@ -187,13 +230,15 @@ export function Dashboard() {
   };
 
   const online = connection.state === "online";
-  const assistantOnline = online && connection.health?.ollama === "online";
+  const assistantOnline = online && (
+    connection.health?.ollama === "online" || connection.health?.demo_mode === true
+  );
 
   return (
-    <main className="shell">
+    <main className={`shell ${connection.health?.demo_mode ? "shell-demo" : ""}`}>
       <div className="scanline" aria-hidden="true" />
       <header className="topbar">
-        <div className="wordmark"><span className="mark">J</span><span>JARVIS</span><small>LOCAL SYSTEM</small></div>
+        <div className="wordmark"><span className="mark">J</span><span>JARVIS</span><small>{connection.health?.demo_mode ? "SAFE DEMO WORKSPACE" : "LOCAL SYSTEM"}</small></div>
         <div className="system-time"><span>PRIMARY NODE</span><strong>MACOS // LOCAL</strong></div>
       </header>
 
@@ -206,7 +251,7 @@ export function Dashboard() {
             <p className="eyebrow">ASSISTANT CORE / 01</p>
             <h1 id="assistant-name">JARVIS</h1>
             <div className={`status ${connection.state === "checking" ? "checking" : assistantOnline ? "online" : "offline"}`}>
-              <span /> {connection.state === "checking" ? "CONNECTING" : assistantOnline ? "ONLINE" : "OFFLINE"}
+              <span /> {connection.state === "checking" ? "CONNECTING" : connection.health?.demo_mode ? "DEMO READY" : assistantOnline ? "ONLINE" : "OFFLINE"}
             </div>
           </div>
         </div>
@@ -224,11 +269,12 @@ export function Dashboard() {
           <div className="transcript" aria-live="polite" aria-label="Conversation transcript">
             {messages.map((message) => (
               <div className={`message message-${message.role}`} key={message.id}>
-                <span>{message.role === "user" ? "YOU" : message.role === "assistant" ? "JARVIS" : "SYSTEM"}</span>
-                <p>{message.content}</p>
+                <span>{message.role === "user" ? "YOU" : message.role === "assistant" ? "JARVIS" : message.role === "tool" ? "APPROVED TOOL" : "SYSTEM"}</span>
+                {message.role === "tool" ? <p><Check aria-hidden="true" size={14} />{message.content}<small>{message.state === "completed" ? "VERIFIED" : message.state === "failed" ? "FAILED SAFELY" : "RUNNING"}</small></p> : <p>{message.content}</p>}
               </div>
             ))}
-            {sending && <div className="message message-assistant message-loading"><span>EXECUTION</span><p>{progress}</p></div>}
+            {sending && !toolActive && <div className="message message-assistant message-loading"><span>EXECUTION</span><p>{progress}</p></div>}
+            <div ref={transcriptEnd} />
           </div>
         )}
         <form onSubmit={submit} className="command-form">
@@ -280,9 +326,34 @@ export function Dashboard() {
 
       <MemoryPanel projects={projects?.projects ?? []} />
 
+      <section className="skills" aria-labelledby="skills-title">
+        <div className="section-label"><span>05</span><h2 id="skills-title">SKILLS</h2><i /></div>
+        {skillsUnavailable ? (
+          <div className="project-empty project-unavailable" role="status">
+            <p>SKILL REGISTRY UNAVAILABLE</p>
+            <button type="button" onClick={() => void loadSkills()} disabled={skillsLoading}>
+              {skillsLoading ? "RETRYING SKILL REGISTRY" : "RETRY SKILL REGISTRY"}
+            </button>
+          </div>
+        ) : skillsLoading && !skills ? (
+          <div className="project-empty">SKILL REGISTRY SYNCHRONISING</div>
+        ) : (
+          <div className="skill-console">
+            {skills?.skills.map((skill) => (
+              <article key={skill.name}>
+                <Sparkles aria-hidden="true" size={15} />
+                <div><h3>{skill.name.replaceAll("-", " ")}</h3><p>{skill.description}</p></div>
+                <span>{`${skill.scope} // V${skill.version} // READY`}</span>
+              </article>
+            ))}
+            {skills?.count === 0 && <p className="skill-empty">NO SKILLS AVAILABLE</p>}
+          </div>
+        )}
+      </section>
+
       <footer>
         <span><ShieldCheck size={14} /> LOCAL-FIRST // NO CLOUD UPLINK</span>
-        <span><Github size={14} /> EXECUTION BUILD 0.6.0</span>
+        <span><Github size={14} /> EXECUTION BUILD 0.7.0</span>
       </footer>
     </main>
   );
@@ -335,6 +406,14 @@ function boundCompletedTranscript(messages: Message[]): Message[] {
       > MAX_STORED_CHARACTERS
   ) {
     bounded.splice(0, 2);
+  }
+  return bounded;
+}
+
+function boundVisibleTranscript(messages: Message[]): Message[] {
+  const bounded = messages.slice(-36);
+  while (bounded.length > 0 && bounded.reduce((total, message) => total + message.content.length, 0) > MAX_STORED_CHARACTERS) {
+    bounded.shift();
   }
   return bounded;
 }

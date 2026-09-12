@@ -41,6 +41,7 @@ class FakeOllama:
         self.received_history: tuple[ConversationTurn, ...] = ()
         self.received_memories = ()
         self.route_count = 0
+        self.received_skill = None
 
     async def is_available(self) -> bool:
         return self.available
@@ -88,6 +89,9 @@ class FakeOllama:
             raise OllamaUnavailableError("offline")
         return self.tool_call
 
+    async def route_skill(self, message, assistant, skill_index, history=()):
+        return None
+
     async def chat_grounded(
         self,
         message: str,
@@ -95,9 +99,28 @@ class FakeOllama:
         tool_name: str,
         tool_result: dict[str, object],
         history: tuple[ConversationTurn, ...] = (),
+        memories: tuple = (),
+        skill=None,
     ) -> str:
         self.grounded_result = tool_result
+        self.received_skill = skill
         return self.response
+
+    async def chat_grounded_stream(
+        self,
+        message,
+        assistant,
+        tool_name,
+        tool_result,
+        history=(),
+        memories=(),
+        skill=None,
+    ):
+        self.grounded_result = tool_result
+        self.received_skill = skill
+        midpoint = max(1, len(self.response) // 2)
+        yield self.response[:midpoint]
+        yield self.response[midpoint:]
 
 
 class SlowFakeOllama(FakeOllama):
@@ -153,9 +176,10 @@ def test_health_reports_ollama_and_model() -> None:
     assert response.json() == {
         "status": "ok",
         "service": "jarvis-api",
-        "version": "0.6.0",
+        "version": "0.7.0",
         "ollama": "online",
         "model": "test-model",
+        "demo_mode": False,
     }
 
 
@@ -191,6 +215,37 @@ def test_run_http_streams_response_and_enforces_ownership() -> None:
     assert "run.completed" in events.text
     assert wrong_owner.status_code == 403
     assert conversations.get(UUID(conversation_id)).turns[0].assistant == "Streamed response."
+
+
+def test_explicit_skill_executes_through_run_http_and_emits_safe_events(tmp_path: Path) -> None:
+    project = tmp_path / "ExoHunter"
+    project.mkdir()
+    (project / "package.json").write_text("{}")
+    fake = FakeOllama(response="Grounded skill response.")
+    conversations = ConversationStore()
+    with client_for(fake, projects_root=tmp_path, conversations=conversations) as client:
+        conversation_id = create_conversation(client)
+        created = client.post(
+            "/runs",
+            json={
+                "message": "Use project-summary on ExoHunter.",
+                "conversation_id": conversation_id,
+            },
+        )
+        events = client.get(
+            f"/runs/{created.json()['run_id']}/events",
+            params={"conversation_id": conversation_id},
+        )
+
+    assert created.status_code == 201
+    assert events.status_code == 200
+    assert "skill.selected" in events.text
+    assert "skill.completed" in events.text
+    assert "project-summary" in events.text
+    assert "Selected skill procedure" not in events.text
+    assert str(tmp_path) not in events.text
+    assert fake.received_skill.name == "project-summary"
+    assert len(conversations.get(UUID(conversation_id)).turns) == 1
 
 
 def test_explicit_memory_mutation_works_through_run_runtime() -> None:

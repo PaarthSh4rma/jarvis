@@ -7,6 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     environment: str = "development"
+    demo_mode: bool = False
     database_url: str = "sqlite:///./data/jarvis.db"
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     ollama_base_url: str = Field(
@@ -20,6 +21,10 @@ class Settings(BaseSettings):
     projects_root: Path = Field(
         default_factory=lambda: Path.home() / "Developer",
         validation_alias=AliasChoices("PROJECTS_ROOT", "JARVIS_PROJECTS_ROOT"),
+    )
+    skills_root: Path = Field(
+        default_factory=lambda: Path(__file__).resolve().parents[3] / "skills",
+        validation_alias=AliasChoices("SKILLS_ROOT", "JARVIS_SKILLS_ROOT"),
     )
     conversation_ttl_seconds: int = Field(
         default=1800,
