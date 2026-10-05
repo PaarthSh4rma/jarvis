@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "jarvis-api"
 version = "0.7.0"
 description = "Local-first JARVIS API"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",
@@ -26,7 +26,7 @@ include = ["jarvis_api*"]
 testpaths = ["tests"]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]

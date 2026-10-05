@@ -5,8 +5,8 @@ A local-first personal assistant and developer command centre. V0.7 adds a bound
 ## Prerequisites
 
 - macOS (primary development environment)
-- Node.js 20+ and npm 10+
-- Python 3.10+
+- Node.js 22 (the CI baseline) and npm 10+
+- Python 3.11+ (`StrEnum` and `datetime.UTC` are used)
 - [Ollama for macOS](https://docs.ollama.com/macos)
 
 ## Setup
@@ -31,7 +31,9 @@ cp .env.example .env
 cp apps/web/.env.example apps/web/.env.local
 ```
 
-No secrets are required for this milestone. Environment files are ignored by Git.
+No secrets are required for local chat, mission records, or public Hermes health.
+Hermes capability discovery optionally needs a backend-only gateway credential.
+Environment files are ignored by Git.
 
 ### Configure Ollama
 
@@ -79,6 +81,105 @@ npm run dev:web
 ```
 
 Open [http://localhost:3000](http://localhost:3000). The dashboard reports API and Ollama health independently. Messages travel only from the browser to FastAPI and from FastAPI to local Ollama; the browser never receives a general Ollama proxy.
+
+## Hermes foundation (unreleased, based on V0.7)
+
+The Systems section now checks Hermes independently of Ollama and chat. It shows
+gateway liveness, verified version, a limited advertised-capability summary, and
+the last successful health check. Checking runs on mount and on explicit retry;
+there is no background scheduler. Offline Hermes does not prevent JARVIS loading.
+
+The backend only calls `GET /health` and `GET /v1/capabilities` on Hermes.
+Configure `JARVIS_HERMES_BASE_URL` (default `http://127.0.0.1:8642`). Only HTTP
+loopback origins are accepted; localhost is pinned to 127.0.0.1, redirects and
+environment proxies are disabled. Checks have a 1-second connect timeout,
+2-second read timeout, 4-second total deadline, and 64 KiB response limit.
+
+If authenticated capability discovery is desired, an operator may separately
+supply `JARVIS_HERMES_API_KEY` to the JARVIS backend environment. This sprint does
+not read Hermes credential files or provision/copy credentials. The key is never
+returned to the frontend. Without access to the capability endpoint, the UI
+can still display verified public health; capability state is `UNKNOWN` on
+401/403. `ONLINE` means the relevant endpoint returned a validated response,
+not that workers are configured or ready to execute.
+
+Read-only JARVIS endpoints:
+
+- `GET /integrations/hermes/health`
+- `GET /integrations/hermes/capabilities`
+
+Both return `state`, `version`, `capabilities`, `checked_at`,
+`last_successful_check`, and a fixed safe `reason`. Network/timeouts return
+`OFFLINE`; invalid responses or HTTP failures return `DEGRADED`; denied
+authentication returns `UNKNOWN`. Upstream bodies/configuration are not relayed.
+Last-success timestamps are process-local and tracked separately per endpoint.
+
+### Local missions and approvals
+
+Mission records live in a dedicated SQLite `missions` table, separate from
+ephemeral runs and memory. No mission operation calls a model or dispatches work.
+
+- `POST /missions`: `type`, `title`, `goal`, optional `project_id`, `context`,
+  `requested_by` (default `local-user`). Creates `DRAFT` with revision 1.
+- `GET /missions` and `GET /missions/{id}`: durable local records.
+- `PATCH /missions/{id}`: requires `expected_revision`; editable fields are
+  title, goal, project reference, context, and status.
+
+Types are CODE_CHANGE, PROJECT_REVIEW, JOB_APPLICATION, RESEARCH,
+INTERVIEW_PREP, MONEY_EXPERIMENT, and ADMIN. Status contracts also reserve RUNNING,
+WAITING_FOR_APPROVAL, COMPLETED, and FAILED for later execution integration.
+Current CRUD allows DRAFT ↔ READY and either → CANCELLED. Cancellation is terminal.
+READY does not run anything. Existing project IDs are checked when supplied;
+missions without a project do not invoke discovery. Execution IDs and result/
+failure summaries are reserved output fields, not accepted from public mutations.
+Concurrent stale updates return 409. `requested_by` is descriptive local metadata,
+not authenticated identity.
+
+Approval records live in a separate `approvals` table. Internal code can use
+`ApprovalStore.create(ApprovalCreate(...))` with an existing mission UUID,
+action type, summary, and risk context. There is no public creation endpoint.
+
+- `GET /approvals` (optional `mission_id`) and `GET /approvals/{id}`.
+- `POST /approvals/{id}/resolve`: `status` APPROVED/REJECTED/CANCELLED and optional
+  `resolution_note`. PENDING is the initial internal creation state.
+
+Resolution changes only the decision row. It does not change the mission, contact
+Hermes, invoke a tool, or perform the proposed action. Exact retries are idempotent;
+conflicting later decisions return 409. Mission and approval lists accept `limit`
+(default 50, max 100) and `offset`. Unknown mutation fields are rejected.
+Revisions and offsets have SQLite-compatible integer bounds. Database connections
+enable foreign-key enforcement; legacy orphan approvals cannot be resolved.
+There is no mission/approval panel yet; these are backend foundations.
+
+### Ownership and security
+
+JARVIS owns the human interface, durable records, and local decision records.
+Hermes is the intended future orchestration/scheduling/delegation boundary.
+Codex and Claude have data contracts only; no worker implementation exists.
+Paarth OS remains the intended authority for policies, project registry, career
+evidence, and spending rules; no Paarth OS connector was added, and current
+project validation still uses the existing local ProjectService.
+
+Keep the API bound to loopback. Existing JARVIS has no user authentication;
+CORS and opaque UUIDs are not an identity or authorization system. These approval
+records are not yet an authorization gateway for execution. Future execution must
+bind approval to an exact action and mission revision, authenticate the decision
+maker, and enforce permission scope independently of model text.
+
+Not implemented: mission execution, Hermes approval forwarding, Codex/Claude
+workers, scheduling, Daily Brief, Application Factory, career evidence ingestion,
+Crawl4AI, submission, email sending, paid API access, or public deployment.
+
+See [verified Hermes facts](docs/hermes-integration-notes.md),
+[architecture](docs/architecture.md), and [Claude handoff](docs/claude-handoff.md).
+
+### Local test runtime
+
+Use Node 22 to match CI. On an existing Node 26 installation, Vitest/jsdom can
+encounter Node's experimental Web Storage globals. Run
+`NODE_OPTIONS=--no-experimental-webstorage npm test` in that environment.
+No production-code workaround or dependency upgrade is required. Backend CI
+uses Python 3.11; the package metadata now reflects the existing minimum.
 
 ## Record the trusted-reference demo
 

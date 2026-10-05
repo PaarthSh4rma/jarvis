@@ -93,6 +93,39 @@ export class ApiError extends Error {
   }
 }
 
+export type HermesStatus = {
+  state: "ONLINE" | "OFFLINE" | "DEGRADED" | "UNKNOWN";
+  version: string | null;
+  capabilities: string[];
+  checked_at: string;
+  last_successful_check: string | null;
+  reason: "verified" | "unavailable" | "authentication_required" | "invalid_response" | "http_error";
+};
+
+const hermesCapabilities = new Set([
+  "run_submission", "run_status", "run_events_sse", "run_stop",
+  "run_approval_response", "session_resources",
+]);
+
+async function getHermesStatus(path: "health" | "capabilities", signal?: AbortSignal): Promise<HermesStatus> {
+  const response = await fetch(`${getApiUrl()}/integrations/hermes/${path}`, { cache: "no-store", signal });
+  if (!response.ok) throw new ApiError("Hermes status is unavailable.", response.status);
+  const data = (await response.json()) as Partial<HermesStatus> | null;
+  if (!data || !["ONLINE", "OFFLINE", "DEGRADED", "UNKNOWN"].includes(data.state ?? "")
+    || !(data.version === null || (typeof data.version === "string" && /^[a-zA-Z0-9.+_-]{1,64}$/.test(data.version)))
+    || !Array.isArray(data.capabilities) || data.capabilities.length > 6
+    || !data.capabilities.every((item) => hermesCapabilities.has(item))
+    || typeof data.checked_at !== "string" || !Number.isFinite(Date.parse(data.checked_at))
+    || !(data.last_successful_check === null || (typeof data.last_successful_check === "string" && Number.isFinite(Date.parse(data.last_successful_check))))
+    || !["verified", "unavailable", "authentication_required", "invalid_response", "http_error"].includes(data.reason ?? "")) {
+    throw new ApiError("Hermes returned an invalid status response.");
+  }
+  return data as HermesStatus;
+}
+
+export const getHermesHealth = (signal?: AbortSignal) => getHermesStatus("health", signal);
+export const getHermesCapabilities = (signal?: AbortSignal) => getHermesStatus("capabilities", signal);
+
 type BrowserLocation = Pick<Location, "hostname" | "protocol">;
 
 export function resolveApiUrl(

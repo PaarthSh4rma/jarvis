@@ -139,3 +139,6 @@ footer span { display:flex; align-items:center; gap:7px; }
 .shell-demo .command-zone { padding-top:18px; }
 .shell-demo .systems,.shell-demo .projects,.shell-demo .memory,.shell-demo .skills,.shell-demo footer { display:none; }
 .shell-demo .transcript { max-height:420px; }
+.hermes-status p { overflow-wrap: anywhere; }
+.hermes-status button { margin-top: 8px; font: inherit; cursor: pointer; }
+.hermes-status button:disabled { cursor: wait; opacity: .6; }

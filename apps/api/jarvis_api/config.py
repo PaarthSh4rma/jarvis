@@ -1,11 +1,21 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    hermes_base_url: str = "http://127.0.0.1:8642"
+    hermes_api_key: SecretStr | None = None
+
+    @field_validator("hermes_base_url")
+    @classmethod
+    def loopback_hermes_origin(cls, value: str) -> str:
+        from jarvis_api.integrations.hermes import validate_base_url
+
+        return validate_base_url(value)
+
     environment: str = "development"
     demo_mode: bool = False
     database_url: str = "sqlite:///./data/jarvis.db"

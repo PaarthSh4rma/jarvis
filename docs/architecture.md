@@ -23,6 +23,9 @@ The implemented cross-surface contracts are:
 - `GET /skills`: safe bounded metadata for repository-authored skills.
 - `GET/POST /memory`: list or add bounded persistent memory.
 - `PATCH/DELETE /memory/{memory_id}`: update or delete one opaque memory entry.
+- `GET /integrations/hermes/health` and `/capabilities`: bounded read-only status.
+- `POST/GET /missions`, `GET/PATCH /missions/{id}`: deterministic durable mission records.
+- `GET /approvals`, `GET /approvals/{id}`, `POST /approvals/{id}/resolve`: local decisions.
 
 The runtime flow is deliberately narrow. `/chat` remains the non-streaming compatibility path:
 
@@ -48,7 +51,7 @@ Ollama is never called from the browser. The backend selects the configured mode
 
 ## Local-first boundaries
 
-SQLite lives under the repository-local `data` directory by default and is excluded from source control. It stores only explicit persistent memory, not chat transcripts, runs, or skill history. General settings use `JARVIS_` variables; Ollama, project discovery, and skill discovery use the explicit `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `PROJECTS_ROOT`, and `SKILLS_ROOT` variables. Secrets must live only in ignored environment files or a future macOS keychain adapter.
+SQLite lives under the repository-local `data` directory by default and is excluded from source control. It stores explicit persistent memory, missions, and local approval decisions, not chat transcripts, runs, or skill history. General settings use `JARVIS_` variables; Ollama, project discovery, and skill discovery use the explicit `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `PROJECTS_ROOT`, and `SKILLS_ROOT` variables. Secrets must live only in ignored environment files or a future macOS keychain adapter.
 
 The API is the intended boundary for persistence, model access, tools, and integrations. UI components should not reach Ollama, SQLite, or third-party services directly.
 
@@ -179,6 +182,59 @@ Calls have short timeouts, capture output, and never use `shell=True`. A failed 
 
 Approved tools are `list_projects`, `get_project_status`, `get_recent_project_activity`, and `open_project`. The launch tool supports only VS Code and Finder. Permission is derived from explicit original user wording, including the named project and application; the model cannot grant permission.
 
+## Hermes and durable domain foundation
+
+The foundation adds a separate deterministic path without changing the assistant:
+
+```text
+HermesStatus UI -> routes/integrations -> HermesAdapter -> loopback GET only
+Mission API    -> MissionStore        -> SQLite missions
+Approval API   -> ApprovalStore       -> SQLite approvals
+```
+
+`main.py` wires these services through app state and initializes additive tables
+at startup. Focused routers avoid growing the conversation controller. These
+paths have no dependency on Ollama, RunStore, or AssistantOrchestrator. Only
+mission mutations supplying a project ID use ProjectService for validation.
+There is no dispatch edge from a mission or approval to Hermes.
+
+Hermes checks validate identity fields and a small allowlist of boolean features.
+Unknown upstream metadata is discarded. HTTP is restricted to literal loopback
+(localhost is normalized), with no redirects or environment proxies. Only the
+capability request can carry the optional backend SecretStr credential. Public
+health checks do not send it. Response bodies are bounded to 64 KiB; compressed
+responses are rejected; connect/read/total deadlines prevent indefinite waiting.
+No upstream exception text, error body, model name, endpoint map, or credential
+is exposed. ONLINE is endpoint liveness/validity, not worker readiness.
+
+Missions use UUIDs, bounded explicit schemas, timestamps serialized as UTC ISO
+strings, and revision-based conditional updates. Creation is always DRAFT.
+Public updates allow DRAFT/READY/CANCELLED only; execution-state contracts and
+execution-result fields are reserved for future trusted services. Terminal
+missions are immutable through the current API. Approvals use an atomic
+PENDING-only conditional update; a matching retry returns the original decision,
+while a competing decision conflicts. They reference an existing mission checked
+within the creation transaction. There is no mission deletion API. The shared
+SQLite engine factory now enables foreign keys on every physical connection,
+preventing deletion of a referenced mission through those connections. Resolution
+also rejects orphan records left by legacy/external connections and rolls back
+the attempted decision. No distributed locks or new persistence engine were added.
+Public revisions and offsets are bounded to SQLite's signed integer range, so
+oversized client integers return 422 rather than overflowing database bindings.
+
+Tables are initialized with idempotent SQLAlchemy `create_all`, consistent with
+existing memory. There is no migration framework yet; future table alterations
+need an explicit migration rather than assuming `create_all` upgrades columns.
+`requested_by` is local descriptive data, not identity. Approval rows capture a
+human decision, not an executable grant; future action/revision binding and
+authenticated human resolution are prerequisites for using them to authorize work.
+
+JARVIS owns user-facing records and decisions. Hermes will own orchestration,
+scheduling and worker execution. `agents.py` only defines AgentKind, AgentTask,
+and AgentResult; permission scope is a declaration awaiting an executor, not an
+implemented sandbox. Paarth OS policy/career/project authority is a target
+boundary, not an implemented integration. Application Factory remains absent.
+
 ## Future extension points
 
 - Persist sessions only if a later milestone establishes an explicit local transcript-retention policy.
@@ -187,4 +243,4 @@ Approved tools are `list_projects`, `get_project_status`, `get_recent_project_ac
 - Introduce background jobs only when a real workload requires them.
 - Consider skill composition only after a later milestone defines bounded sequencing and authority rules.
 
-Automatic or model-authored skill creation/editing, marketplaces, arbitrary shell/Python execution, Codex delegation, MCP, authentication, hosted infrastructure, transcript history, semantic memory, voice, browser automation, schedulers, agent frameworks, and external connectors are intentionally outside this milestone.
+Automatic or model-authored skill creation/editing, marketplaces, arbitrary shell/Python execution, Codex delegation, MCP, authentication, hosted infrastructure, transcript history, semantic memory, voice, browser automation, schedulers, agent frameworks, and external action connectors remain outside this foundation.

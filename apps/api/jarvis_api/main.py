@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 
+from jarvis_api.approvals import ApprovalStore
 from jarvis_api.assistants import get_assistant
 from jarvis_api.config import get_settings
 from jarvis_api.conversations import (
@@ -17,10 +18,13 @@ from jarvis_api.conversations import (
     ConversationStore,
 )
 from jarvis_api.database import create_database_engine
+from jarvis_api.integrations.hermes import HermesAdapter
 from jarvis_api.memory import MemoryEntry, MemoryLimitError, MemoryNotFoundError, MemoryStore
+from jarvis_api.missions import MissionStore
 from jarvis_api.ollama import OllamaService, OllamaUnavailableError
 from jarvis_api.orchestration import AssistantOrchestrator
 from jarvis_api.projects import DemoProjectService, ProjectNotFoundError, ProjectService
+from jarvis_api.routes import approvals, integrations, missions
 from jarvis_api.runs import (
     RunConflictError,
     RunExecutor,
@@ -132,11 +136,20 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
     memory_store.initialize()
+    app.state.missions.initialize()
+    app.state.approvals.initialize()
     yield
     engine.dispose()
 
 
 app = FastAPI(title="JARVIS API", version=VERSION, lifespan=lifespan)
+app.state.hermes = HermesAdapter(settings.hermes_base_url, settings.hermes_api_key)
+app.state.missions = MissionStore(engine)
+app.state.approvals = ApprovalStore(engine)
+app.state.mission_projects = project_service
+app.include_router(integrations.router)
+app.include_router(missions.router)
+app.include_router(approvals.router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,

@@ -4,6 +4,7 @@ import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUp, Braces, Check, CircleDot, Cpu, FolderGit2, Github, Radio, RotateCcw, ShieldCheck, Sparkles, Square, TerminalSquare } from "lucide-react";
 import { ApiError, cancelRun, createConversation, createRun, deleteConversation, getHealth, getProjects, getSkills, streamRun, type HealthResponse, type ProjectsResponse, type RunEvent, type SkillsResponse } from "@/lib/api";
 import { MemoryPanel } from "@/components/memory-panel";
+import { HermesStatus } from "@/components/hermes-status";
 
 type Connection = { state: "checking" | "online" | "offline"; health?: HealthResponse };
 type Message = { id: number; role: "user" | "assistant" | "error" | "tool"; content: string; state?: "running" | "completed" | "failed" };
@@ -292,7 +293,8 @@ export function Dashboard() {
           <System icon={<Cpu />} title="Assistant model" value={connection.health?.model ?? "Awaiting runtime"} state={connection.health?.ollama ?? "standby"} />
           <System icon={<Braces />} title="Coding specialist" value="Codex / separate" state="isolated" />
           <System icon={<CircleDot />} title="Persistence" value="SQLite / ready" state="ready" />
-          <System icon={<Radio />} title="External links" value="No connections" state="offline" />
+          <System icon={<Radio />} title="External actions" value="No execution bridge" state="disabled" />
+          <HermesStatus />
         </div>
       </section>
 
