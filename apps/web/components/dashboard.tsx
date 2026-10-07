@@ -1,13 +1,18 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { ArrowUp, Braces, Check, CircleDot, Cpu, FolderGit2, Github, Radio, RotateCcw, ShieldCheck, Sparkles, Square, TerminalSquare } from "lucide-react";
+import { Activity, Cpu, Database, FolderGit2, Github, ShieldCheck } from "lucide-react";
 import { ApiError, cancelRun, createConversation, createRun, deleteConversation, getHealth, getProjects, getSkills, streamRun, type HealthResponse, type ProjectsResponse, type RunEvent, type SkillsResponse } from "@/lib/api";
-import { MemoryPanel } from "@/components/memory-panel";
+import { CommandConsole, type ConsoleMessage } from "@/components/command-console";
+import { ApprovalPanel } from "@/components/approval-panel";
 import { HermesStatus } from "@/components/hermes-status";
+import { MemoryPanel } from "@/components/memory-panel";
+import { MissionPanel } from "@/components/mission-panel";
+import { ProjectPanel } from "@/components/project-panel";
+import { SkillsPanel } from "@/components/skills-panel";
 
 type Connection = { state: "checking" | "online" | "offline"; health?: HealthResponse };
-type Message = { id: number; role: "user" | "assistant" | "error" | "tool"; content: string; state?: "running" | "completed" | "failed" };
+type Message = ConsoleMessage;
 const SESSION_STORAGE_KEY = "jarvis.conversation-id";
 const TRANSCRIPT_STORAGE_KEY = "jarvis.completed-transcript.v1";
 const MAX_STORED_MESSAGES = 24;
@@ -89,10 +94,12 @@ export function Dashboard() {
     };
   }, [loadProjects, loadSkills]);
 
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    const message = command.trim();
-    if (!message || sending || connection.health?.ollama !== "online") return;
+  const runCommand = async (rawCommand: string) => {
+    const message = rawCommand.trim();
+    const runtimeReady = connection.state === "online" && (
+      connection.health?.ollama === "online" || connection.health?.demo_mode === true
+    );
+    if (!message || sending || !runtimeReady) return;
 
     const userMessage: Message = { id: Date.now(), role: "user", content: message };
     setMessages((current) => [...current, userMessage]);
@@ -194,6 +201,11 @@ export function Dashboard() {
     }
   };
 
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    void runCommand(command);
+  };
+
   const stopRun = async () => {
     if (!activeRunId || !conversationId) return;
     setProgress("CANCELLING");
@@ -238,131 +250,87 @@ export function Dashboard() {
   return (
     <main className={`shell ${connection.health?.demo_mode ? "shell-demo" : ""}`}>
       <div className="scanline" aria-hidden="true" />
-      <header className="topbar">
-        <div className="wordmark"><span className="mark">J</span><span>JARVIS</span><small>{connection.health?.demo_mode ? "SAFE DEMO WORKSPACE" : "LOCAL SYSTEM"}</small></div>
-        <div className="system-time"><span>PRIMARY NODE</span><strong>MACOS // LOCAL</strong></div>
+      <header className="console-header">
+        <div className="wordmark">
+          <span className={`core-mark ${assistantOnline ? "online" : ""}`} aria-hidden="true"><i /></span>
+          <div><strong>JARVIS</strong><small>{connection.health?.demo_mode ? "SAFE DEMO WORKSPACE" : "LOCAL COMMAND CENTRE"}</small></div>
+        </div>
+        <div className="header-status" aria-live="polite">
+          <span className={`status-dot ${connection.state === "checking" ? "checking" : assistantOnline ? "online" : "offline"}`} />
+          <div><span>ASSISTANT</span><strong>{connection.state === "checking" ? "CONNECTING" : connection.health?.demo_mode ? "DEMO READY" : assistantOnline ? "ONLINE" : "OFFLINE"}</strong></div>
+        </div>
       </header>
 
-      <section className="hero" aria-labelledby="assistant-name">
-        <div className="identity">
-          <div className={`orb ${assistantOnline ? "orb-online" : ""}`} aria-hidden="true">
-            <div className="orb-core" /><div className="orbit orbit-one" /><div className="orbit orbit-two" />
-          </div>
-          <div>
-            <p className="eyebrow">ASSISTANT CORE / 01</p>
-            <h1 id="assistant-name">JARVIS</h1>
-            <div className={`status ${connection.state === "checking" ? "checking" : assistantOnline ? "online" : "offline"}`}>
-              <span /> {connection.state === "checking" ? "CONNECTING" : connection.health?.demo_mode ? "DEMO READY" : assistantOnline ? "ONLINE" : "OFFLINE"}
-            </div>
-          </div>
-        </div>
+      <div className="workspace-grid">
+        <CommandConsole
+          command={command}
+          messages={messages}
+          online={assistantOnline}
+          sending={sending}
+          resetting={resetting}
+          activeRun={Boolean(activeRunId)}
+          progress={progress}
+          toolActive={toolActive}
+          transcriptEnd={transcriptEnd}
+          projectName={projects?.recent_projects[0]?.name ?? projects?.projects[0]?.name}
+          onCommandChange={setCommand}
+          onSubmit={submit}
+          onRunCommand={(nextCommand) => void runCommand(nextCommand)}
+          onStop={() => void stopRun()}
+          onNewSession={() => void startNewSession()}
+        />
 
-        <div className="readout" aria-label="System readout">
-          <div><span>MODEL</span><strong>{online ? connection.health?.model.toUpperCase() : "UNKNOWN"}</strong></div>
-          <div><span>API</span><strong>{online ? "ONLINE" : "UNREACHABLE"}</strong></div>
-          <div><span>OLLAMA</span><strong>{online ? connection.health?.ollama.toUpperCase() : "UNKNOWN"}</strong></div>
-        </div>
-      </section>
-
-      <section className="command-zone" aria-labelledby="command-title">
-        <div className="section-label"><span>01</span><h2 id="command-title">COMMAND INTERFACE</h2><i /><button className="session-reset" type="button" onClick={startNewSession} disabled={sending || resetting}><RotateCcw size={12} />{resetting ? "RESETTING" : "NEW SESSION"}</button></div>
-        {messages.length > 0 && (
-          <div className="transcript" aria-live="polite" aria-label="Conversation transcript">
-            {messages.map((message) => (
-              <div className={`message message-${message.role}`} key={message.id}>
-                <span>{message.role === "user" ? "YOU" : message.role === "assistant" ? "JARVIS" : message.role === "tool" ? "APPROVED TOOL" : "SYSTEM"}</span>
-                {message.role === "tool" ? <p><Check aria-hidden="true" size={14} />{message.content}<small>{message.state === "completed" ? "VERIFIED" : message.state === "failed" ? "FAILED SAFELY" : "RUNNING"}</small></p> : <p>{message.content}</p>}
-              </div>
-            ))}
-            {sending && !toolActive && <div className="message message-assistant message-loading"><span>EXECUTION</span><p>{progress}</p></div>}
-            <div ref={transcriptEnd} />
+        <aside className="readiness" aria-labelledby="readiness-title">
+          <div className="section-label"><span>LIVE</span><h2 id="readiness-title">READINESS</h2><i /></div>
+          <div className="readiness-panel">
+            <StatusItem icon={<Activity />} label="JARVIS API" value={online ? "ONLINE" : connection.state === "checking" ? "CHECKING" : "UNREACHABLE"} state={online ? "ready" : "error"} />
+            <StatusItem icon={<Cpu />} label="OLLAMA" value={online ? connection.health?.ollama.toUpperCase() ?? "UNKNOWN" : "UNKNOWN"} state={assistantOnline ? "ready" : "error"} />
+            <StatusItem icon={<FolderGit2 />} label="PROJECT INDEX" value={projectsLoading ? "SYNCING" : projectsUnavailable ? "UNAVAILABLE" : `${projects?.count ?? 0} DISCOVERED`} state={projectsUnavailable ? "error" : projectsLoading ? "busy" : "ready"} />
+            <StatusItem icon={<Database />} label="LOCAL MODEL" value={online ? connection.health?.model.toUpperCase() ?? "UNKNOWN" : "UNKNOWN"} state={assistantOnline ? "ready" : "standby"} />
+            <HermesStatus />
           </div>
-        )}
-        <form onSubmit={submit} className="command-form">
-          <TerminalSquare aria-hidden="true" size={19} />
-          <label htmlFor="command" className="sr-only">Enter a command</label>
-          <input id="command" value={command} onChange={(event) => setCommand(event.target.value)} placeholder={assistantOnline ? "Awaiting directive..." : "Ollama runtime unavailable"} autoComplete="off" maxLength={4000} disabled={!assistantOnline || sending} />
-          {sending ? <button type="button" onClick={stopRun} disabled={!activeRunId} aria-label="Stop execution"><Square size={15} /> STOP</button> : <button type="submit" disabled={!command.trim() || !assistantOnline} aria-label="Send message"><ArrowUp size={18} /></button>}
-        </form>
-        <p className="command-note">LOCAL EXECUTION RUNTIME // {sending ? progress : "READY"}</p>
-      </section>
-
-      <section className="systems" aria-labelledby="systems-title">
-        <div className="section-label"><span>02</span><h2 id="systems-title">SYSTEMS</h2><i /></div>
-        <div className="system-grid">
-          <System icon={<Cpu />} title="Assistant model" value={connection.health?.model ?? "Awaiting runtime"} state={connection.health?.ollama ?? "standby"} />
-          <System icon={<Braces />} title="Coding specialist" value="Codex / separate" state="isolated" />
-          <System icon={<CircleDot />} title="Persistence" value="SQLite / ready" state="ready" />
-          <System icon={<Radio />} title="External actions" value="No execution bridge" state="disabled" />
-          <HermesStatus />
-        </div>
-      </section>
-
-      <section className="projects" aria-labelledby="projects-title">
-        <div className="section-label"><span>03</span><h2 id="projects-title">PROJECTS</h2><i /></div>
-        {projectsUnavailable ? (
-          <div className="project-empty project-unavailable" role="status">
-            <p>PROJECT INDEX UNAVAILABLE</p>
-            <button type="button" onClick={() => void loadProjects()} disabled={projectsLoading}>
-              {projectsLoading ? "RETRYING PROJECT INDEX" : "RETRY PROJECT INDEX"}
-            </button>
+          <div className="boundary-note">
+            <ShieldCheck size={15} aria-hidden="true" />
+            <div><strong>LOCAL EXECUTION</strong><p>Project tools stay inside discovered roots and validated actions.</p></div>
           </div>
-        ) : projectsLoading && !projects ? (
-          <div className="project-empty">PROJECT INDEX SYNCHRONISING</div>
-        ) : (
-          <div className="project-console">
-            <div className="project-metric"><FolderGit2 size={18} /><span>DISCOVERED</span><strong>{projects?.count ?? "—"}</strong></div>
-            <div className="project-metric"><CircleDot size={18} /><span>DIRTY REPOSITORIES</span><strong>{projects?.dirty_count ?? "—"}</strong></div>
-            <div className="project-recent">
-              <span>RECENT ACTIVITY</span>
-              <div>
-                {projects?.recent_projects.map((project) => (
-                  <p key={project.id}><strong>{project.name}</strong><small>{project.branch ?? project.technologies[0] ?? "LOCAL"}</small></p>
-                )) ?? <p><strong>SCANNING</strong></p>}
-                {projects?.count === 0 && <p><strong>NO PROJECTS DISCOVERED</strong></p>}
-              </div>
-            </div>
-          </div>
-        )}
-      </section>
+        </aside>
+      </div>
 
-      <MemoryPanel projects={projects?.projects ?? []} />
+      <ProjectPanel
+        data={projects}
+        loading={projectsLoading}
+        unavailable={projectsUnavailable}
+        actionsDisabled={!assistantOnline || sending}
+        onRetry={() => void loadProjects()}
+        onCommand={(nextCommand) => void runCommand(nextCommand)}
+      />
 
-      <section className="skills" aria-labelledby="skills-title">
-        <div className="section-label"><span>05</span><h2 id="skills-title">SKILLS</h2><i /></div>
-        {skillsUnavailable ? (
-          <div className="project-empty project-unavailable" role="status">
-            <p>SKILL REGISTRY UNAVAILABLE</p>
-            <button type="button" onClick={() => void loadSkills()} disabled={skillsLoading}>
-              {skillsLoading ? "RETRYING SKILL REGISTRY" : "RETRY SKILL REGISTRY"}
-            </button>
-          </div>
-        ) : skillsLoading && !skills ? (
-          <div className="project-empty">SKILL REGISTRY SYNCHRONISING</div>
-        ) : (
-          <div className="skill-console">
-            {skills?.skills.map((skill) => (
-              <article key={skill.name}>
-                <Sparkles aria-hidden="true" size={15} />
-                <div><h3>{skill.name.replaceAll("-", " ")}</h3><p>{skill.description}</p></div>
-                <span>{`${skill.scope} // V${skill.version} // READY`}</span>
-              </article>
-            ))}
-            {skills?.count === 0 && <p className="skill-empty">NO SKILLS AVAILABLE</p>}
-          </div>
-        )}
-      </section>
+      <div className="control-grid">
+        <MissionPanel projects={projects?.projects ?? []} />
+        <ApprovalPanel />
+      </div>
+
+      <div className="secondary-grid">
+        <MemoryPanel projects={projects?.projects ?? []} />
+        <SkillsPanel data={skills} loading={skillsLoading} unavailable={skillsUnavailable} onRetry={() => void loadSkills()} />
+      </div>
 
       <footer>
-        <span><ShieldCheck size={14} /> LOCAL-FIRST // NO CLOUD UPLINK</span>
+        <span><ShieldCheck size={14} /> LOCAL-FIRST // HUMAN-DIRECTED</span>
         <span><Github size={14} /> EXECUTION BUILD 0.7.0</span>
       </footer>
     </main>
   );
 }
 
-function System({ icon, title, value, state }: { icon: React.ReactNode; title: string; value: string; state: string }) {
-  return <article className="system-item"><div className="system-icon">{icon}</div><div><h3>{title}</h3><p>{value}</p></div><span className="tag">{state}</span></article>;
+function StatusItem({ icon, label, value, state }: { icon: React.ReactNode; label: string; value: string; state: "ready" | "busy" | "standby" | "error" }) {
+  return (
+    <article className="status-item">
+      <div className="status-icon">{icon}</div>
+      <div><span>{label}</span><strong>{value}</strong></div>
+      <i className={state} aria-hidden="true" />
+    </article>
+  );
 }
 
 function restoreCompletedTranscript(conversationId: string | null): Message[] {

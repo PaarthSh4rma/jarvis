@@ -135,6 +135,66 @@ describe("Dashboard", () => {
     expect(screen.getByText("2")).toBeInTheDocument();
   });
 
+  it("runs a validated project command from an operational project card", async () => {
+    const project = {
+      id: "jarvis",
+      name: "jarvis",
+      branch: "feat/stark-ui",
+      is_git_repository: true,
+      is_dirty: true,
+      latest_commit_message: "Refine command centre",
+      latest_commit_timestamp: "2026-10-05T01:00:00Z",
+      technologies: ["TypeScript", "Python"],
+    };
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith("/health")) return Promise.resolve(jsonResponse(onlineHealth));
+      if (url.endsWith("/projects")) return Promise.resolve(jsonResponse({ projects: [project], recent_projects: [project], count: 1, dirty_count: 1 }));
+      if (url.endsWith("/skills")) return Promise.resolve(jsonResponse(emptySkills));
+      if (url.endsWith("/conversations")) return Promise.resolve(jsonResponse(conversationResponse(), true, 201));
+      if (url.endsWith("/runs")) return Promise.resolve(jsonResponse(runResponse(), true, 201));
+      if (url.includes("/events?")) return Promise.resolve(eventResponse("jarvis is on feat/stark-ui with uncommitted changes."));
+      return Promise.resolve(jsonResponse({ memories: [], max_characters: 500 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<Dashboard />);
+
+    expect(await screen.findByText("Refine command centre")).toBeInTheDocument();
+    expect(screen.getByText("feat/stark-ui")).toBeInTheDocument();
+    expect(screen.getByText("TypeScript")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Check jarvis status" }));
+
+    expect(await screen.findByText("jarvis is on feat/stark-ui with uncommitted changes.")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost:8000/runs",
+      expect.objectContaining({
+        body: JSON.stringify({ message: "Check the status of jarvis.", conversation_id: SESSION_ID }),
+      }),
+    );
+  });
+
+  it("formats fenced code in a restored assistant response", async () => {
+    window.localStorage.setItem("jarvis.conversation-id", SESSION_ID);
+    window.sessionStorage.setItem("jarvis.completed-transcript.v1", JSON.stringify({
+      conversationId: SESSION_ID,
+      messages: [
+        { id: 1, role: "user", content: "Show the state." },
+        { id: 2, role: "assistant", content: "Use this:\n```ts\nconst ready = true;\n```" },
+      ],
+    }));
+    vi.stubGlobal("fetch", vi.fn((url: string) => Promise.resolve(
+      url.endsWith("/health") ? jsonResponse(onlineHealth)
+        : url.endsWith("/projects") ? jsonResponse(emptyProjects)
+        : url.endsWith("/skills") ? jsonResponse(emptySkills)
+        : jsonResponse({ memories: [], max_characters: 500 }),
+    )));
+
+    render(<Dashboard />);
+
+    const code = await screen.findByText("const ready = true;");
+    expect(code.closest("pre")).toBeInTheDocument();
+    expect(screen.getByText("ts")).toBeInTheDocument();
+  });
+
   it("replaces project loading state after a successful initial fetch", async () => {
     let resolveProjects!: (value: ReturnType<typeof jsonResponse>) => void;
     const pendingProjects = new Promise<ReturnType<typeof jsonResponse>>((resolve) => {

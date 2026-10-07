@@ -2,13 +2,13 @@
 
 import { useEffect, useState } from "react";
 import { Radio } from "lucide-react";
-import { getHermesCapabilities, getHermesHealth, type HermesStatus as Status } from "@/lib/api";
+import { ApiError, getHermesCapabilities, getHermesHealth, type HermesStatus as Status } from "@/lib/api";
 
 export function HermesStatus() {
   const [health, setHealth] = useState<Status | null>(null);
   const [capabilities, setCapabilities] = useState<Status | null>(null);
   const [checking, setChecking] = useState(true);
-  const [failed, setFailed] = useState(false);
+  const [failure, setFailure] = useState<"unavailable" | "invalid" | null>(null);
   const [check, setCheck] = useState(0);
   const [lastSuccess, setLastSuccess] = useState<string | null>(null);
 
@@ -27,7 +27,9 @@ export function HermesStatus() {
       } else {
         setHealth(null);
       }
-      setFailed(healthResult.status === "rejected");
+      setFailure(healthResult.status === "rejected"
+        ? healthResult.reason instanceof ApiError && healthResult.reason.status === undefined ? "invalid" : "unavailable"
+        : null);
       setCapabilities(capabilitiesResult.status === "fulfilled" ? capabilitiesResult.value : null);
       setChecking(false);
       window.clearTimeout(timeout);
@@ -35,22 +37,24 @@ export function HermesStatus() {
     return () => { active = false; controller.abort(); window.clearTimeout(timeout); };
   }, [check]);
 
-  const state = checking ? "CHECKING" : failed ? "UNKNOWN" : health?.state ?? "UNKNOWN";
+  const state = checking ? "CHECKING" : failure === "unavailable" ? "UNAVAILABLE" : failure === "invalid" ? "UNKNOWN" : health?.state ?? "UNKNOWN";
+  const indicator = state === "ONLINE" ? "ready" : state === "CHECKING" ? "busy" : "error";
   return (
-    <article className="system-item hermes-status" aria-label="Hermes system status">
-      <div className="system-icon"><Radio aria-hidden="true" /></div>
-      <div>
-        <h3>Hermes</h3>
-        <p aria-live="polite">HERMES {state}{health?.version && !checking ? ` / ${health.version}` : ""}</p>
-        <p>Gateway liveness · read-only connection</p>
+    <article className="status-item hermes-status" aria-label="Hermes system status">
+      <div className="status-icon"><Radio aria-hidden="true" /></div>
+      <div className="hermes-copy">
+        <span>HERMES</span>
+        <strong aria-live="polite">HERMES {state}{health?.version && !checking ? ` / ${health.version}` : ""}</strong>
+        <p>READ-ONLY GATEWAY</p>
         {!checking && capabilities?.state === "ONLINE" && <p>Advertised: {capabilities.capabilities.join(", ") || "none"}</p>}
         {!checking && capabilities?.reason === "authentication_required" && <p>Capabilities require authentication</p>}
         {!checking && (!capabilities || (capabilities.state !== "ONLINE" && capabilities.reason !== "authentication_required")) && <p>Capabilities unavailable</p>}
         {lastSuccess && <p>Last successful health check: <time dateTime={lastSuccess}>{new Date(lastSuccess).toLocaleString()}</time></p>}
-        <button type="button" disabled={checking} onClick={() => { setChecking(true); setCheck((value) => value + 1); }}>
-          {checking ? "CHECKING HERMES" : "CHECK HERMES"}
-        </button>
       </div>
+      <i className={indicator} aria-hidden="true" />
+      <button type="button" aria-label={checking ? "CHECKING HERMES" : "CHECK HERMES"} disabled={checking} onClick={() => { setChecking(true); setCheck((value) => value + 1); }}>
+        {checking ? "CHECKING" : "CHECK"}
+      </button>
     </article>
   );
 }

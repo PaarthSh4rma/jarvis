@@ -62,7 +62,8 @@ it.each([true, false])("keeps Hermes controls visible with Ollama offline (Herme
   render(<Dashboard />);
   await waitFor(() => expect(screen.getByRole("button", { name: "CHECK HERMES" })).toBeEnabled());
   const panel = screen.getByRole("article", { name: "Hermes system status" });
-  expect(within(panel).getByText(hermesAvailable ? "HERMES ONLINE / 0.9.0" : "HERMES UNKNOWN")).toBeInTheDocument();
-  expect(screen.getByRole("heading", { name: "JARVIS" })).toBeInTheDocument();
+  expect(within(panel).getByText(hermesAvailable ? "HERMES ONLINE / 0.9.0" : "HERMES UNAVAILABLE")).toBeInTheDocument();
+  expect(screen.getByText("JARVIS")).toBeInTheDocument();
   expect(screen.getByLabelText("Send message")).toBeDisabled();
+  expect(screen.getByRole("button", { name: "CREATE MISSION" })).toBeEnabled();
 });
