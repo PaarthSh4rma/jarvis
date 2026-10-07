@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -269,6 +270,109 @@ async def test_ordinal_open_requires_explicit_target_and_trusted_reference(
     )
 
     assert opened == [(metadata[1]["id"], "vscode")]
+
+
+@pytest.mark.anyio
+async def test_demo_open_uses_validated_vscode_default_without_changing_normal_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    projects, metadata = make_projects(tmp_path)
+    history = (
+        ConversationTurn(
+            user="What projects am I working on?",
+            assistant="Alpha and beta.",
+            tool_observation={"tool": "list_projects", "result": {"projects": metadata}},
+        ),
+    )
+    opened: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        projects,
+        "open_project",
+        lambda project_id, target: opened.append((project_id, target)),
+    )
+
+    normal = await AssistantOrchestrator(
+        FakeRoutingOllama(None), ToolRegistry(projects)
+    ).respond("Open the second one.", JARVIS, history)
+    demo = await AssistantOrchestrator(
+        FakeRoutingOllama(None), ToolRegistry(projects), demo_mode=True
+    ).respond("Open the second one.", JARVIS, history)
+
+    assert "VS Code or Finder" in normal.text
+    assert demo.text == "Opened beta in VS Code."
+    assert opened == [(metadata[1]["id"], "vscode")]
+
+
+@pytest.mark.anyio
+async def test_other_reference_names_only_unselected_trusted_candidates(tmp_path: Path) -> None:
+    projects, metadata = make_projects(tmp_path)
+    gamma = tmp_path / "gamma"
+    gamma.mkdir()
+    (gamma / "package.json").write_text("{}")
+    metadata = [project.public_dict() for project in projects.discover()]
+    history = (
+        ConversationTurn(
+            user="What projects am I working on?",
+            assistant="Three projects.",
+            tool_observation={"tool": "list_projects", "result": {"projects": metadata}},
+        ),
+        ConversationTurn(
+            user="Is it clean?",
+            assistant="beta has no uncommitted changes.",
+            tool_observation={
+                "tool": "get_project_status",
+                "result": {"project": metadata[1]},
+            },
+        ),
+    )
+
+    result = await AssistantOrchestrator(
+        FakeRoutingOllama(None), ToolRegistry(projects)
+    ).respond("Open the other one.", JARVIS, history)
+
+    assert result.text == "Which project do you mean: alpha or gamma?"
+
+
+@pytest.mark.anyio
+async def test_clean_followup_reads_fresh_trusted_status(tmp_path: Path) -> None:
+    projects, metadata = make_projects(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(tmp_path / "beta"), "init", "-b", "main"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path / "beta"), "add", "package.json"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(tmp_path / "beta"), "-c", "user.name=Test User",
+            "-c", "user.email=test@example.invalid", "commit", "-m", "Initial",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    history = (
+        ConversationTurn(
+            user="Open beta in VS Code.",
+            assistant="Opened beta in VS Code.",
+            tool_observation={
+                "tool": "open_project",
+                "result": {"project": metadata[1]},
+            },
+        ),
+    )
+    fake = FakeRoutingOllama(None)
+
+    result = await AssistantOrchestrator(fake, ToolRegistry(projects)).respond(
+        "Is it clean?", JARVIS, history
+    )
+
+    assert result.text == "beta has no uncommitted changes."
+    assert fake.route_count == 0
+    assert result.tool_observation is not None
 
 
 @pytest.mark.anyio

@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 
+from jarvis_api.approvals import ApprovalStore
 from jarvis_api.assistants import get_assistant
 from jarvis_api.config import get_settings
 from jarvis_api.conversations import (
@@ -17,10 +18,13 @@ from jarvis_api.conversations import (
     ConversationStore,
 )
 from jarvis_api.database import create_database_engine
+from jarvis_api.integrations.hermes import HermesAdapter
 from jarvis_api.memory import MemoryEntry, MemoryLimitError, MemoryNotFoundError, MemoryStore
+from jarvis_api.missions import MissionStore
 from jarvis_api.ollama import OllamaService, OllamaUnavailableError
 from jarvis_api.orchestration import AssistantOrchestrator
-from jarvis_api.projects import ProjectNotFoundError, ProjectService
+from jarvis_api.projects import DemoProjectService, ProjectNotFoundError, ProjectService
+from jarvis_api.routes import approvals, integrations, missions
 from jarvis_api.runs import (
     RunConflictError,
     RunExecutor,
@@ -44,14 +48,22 @@ from jarvis_api.schemas import (
     RunCancelRequest,
     RunCreateRequest,
     RunResponse,
+    SkillResponse,
+    SkillsResponse,
 )
+from jarvis_api.skills import SkillRegistry, SkillRegistryError
 from jarvis_api.tools import ToolRegistry
 
-VERSION = "0.6.0"
+VERSION = "0.8.0"
 settings = get_settings()
 engine = create_database_engine(settings.database_url)
 ollama_service = OllamaService(settings.ollama_base_url, settings.ollama_model)
-project_service = ProjectService(settings.projects_root)
+project_service = (
+    DemoProjectService(settings.projects_root)
+    if settings.demo_mode
+    else ProjectService(settings.projects_root)
+)
+skill_registry = SkillRegistry(settings.skills_root)
 conversation_store = ConversationStore(
     ttl_seconds=settings.conversation_ttl_seconds,
     max_turns=settings.conversation_max_turns,
@@ -87,10 +99,15 @@ def get_memory_store() -> MemoryStore:
     return memory_store
 
 
+def get_skill_registry() -> SkillRegistry:
+    return skill_registry
+
+
 OllamaDependency = Annotated[OllamaService, Depends(get_ollama_service)]
 ProjectDependency = Annotated[ProjectService, Depends(get_project_service)]
 ConversationDependency = Annotated[ConversationStore, Depends(get_conversation_store)]
 MemoryDependency = Annotated[MemoryStore, Depends(get_memory_store)]
+SkillDependency = Annotated[SkillRegistry, Depends(get_skill_registry)]
 
 
 def _run_response(run: object) -> RunResponse:
@@ -119,11 +136,20 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     with engine.connect() as connection:
         connection.execute(text("SELECT 1"))
     memory_store.initialize()
+    app.state.missions.initialize()
+    app.state.approvals.initialize()
     yield
     engine.dispose()
 
 
 app = FastAPI(title="JARVIS API", version=VERSION, lifespan=lifespan)
+app.state.hermes = HermesAdapter(settings.hermes_base_url, settings.hermes_api_key)
+app.state.missions = MissionStore(engine)
+app.state.approvals = ApprovalStore(engine)
+app.state.mission_projects = project_service
+app.include_router(integrations.router)
+app.include_router(missions.router)
+app.include_router(approvals.router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
@@ -141,6 +167,7 @@ async def health(service: OllamaDependency) -> HealthResponse:
         version=VERSION,
         ollama=ollama_status,
         model=service.model,
+        demo_mode=settings.demo_mode,
     )
 
 
@@ -151,11 +178,14 @@ async def chat(
     projects: ProjectDependency,
     conversations: ConversationDependency,
     memories: MemoryDependency,
+    skills: SkillDependency,
 ) -> ChatResponse:
     assistant = get_assistant("jarvis")
     try:
         session = conversations.get(request.conversation_id)
-        orchestrator = AssistantOrchestrator(service, ToolRegistry(projects), memories)
+        orchestrator = AssistantOrchestrator(
+            service, ToolRegistry(projects), memories, skills, demo_mode=settings.demo_mode
+        )
         result = await orchestrator.respond(request.message, assistant, tuple(session.turns))
         conversations.append(
             request.conversation_id,
@@ -200,6 +230,7 @@ async def create_run(
     projects: ProjectDependency,
     conversations: ConversationDependency,
     memories: MemoryDependency,
+    skills: SkillDependency,
 ) -> RunResponse:
     try:
         conversations.get(request.conversation_id)
@@ -209,7 +240,9 @@ async def create_run(
         raise HTTPException(code, "Conversation unavailable. Start a new session.") from error
     except RunConflictError as error:
         raise _run_http_error(error) from error
-    orchestrator = AssistantOrchestrator(service, ToolRegistry(projects), memories)
+    orchestrator = AssistantOrchestrator(
+        service, ToolRegistry(projects), memories, skills, demo_mode=settings.demo_mode
+    )
     executor = RunExecutor(
         run_store,
         conversations,
@@ -316,6 +349,21 @@ def get_project(project_id: str, projects: ProjectDependency) -> ProjectResponse
             status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
         ) from error
     return ProjectResponse.model_validate(project.public_dict())
+
+
+@app.get("/skills", response_model=SkillsResponse, tags=["skills"])
+def list_skills(skills: SkillDependency) -> SkillsResponse:
+    try:
+        discovered = skills.discover()
+    except SkillRegistryError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Skill registry unavailable.",
+        ) from error
+    return SkillsResponse(
+        skills=[SkillResponse.model_validate(skill.public_dict()) for skill in discovered],
+        count=len(discovered),
+    )
 
 
 def _memory_response(

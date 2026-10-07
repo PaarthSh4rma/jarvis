@@ -13,6 +13,7 @@ PROJECT_MARKERS = {
     "go.mod": "Go",
 }
 GIT_TIMEOUT_SECONDS = 3.0
+DEMO_PROJECT_ORDER = ("RaceBrain", "ExoHunter", "ClientOps Copilot")
 
 
 class ProjectNotFoundError(LookupError):
@@ -164,3 +165,15 @@ class ProjectService:
         except (OSError, subprocess.SubprocessError):
             return None
         return result.stdout.strip()
+
+
+class DemoProjectService(ProjectService):
+    """Project discovery with a stable presentation order for the isolated demo fixture."""
+
+    def discover(self) -> list[ProjectMetadata]:
+        projects = super().discover()
+        order = {name: index for index, name in enumerate(DEMO_PROJECT_ORDER)}
+        return sorted(
+            projects,
+            key=lambda project: (order.get(project.name, len(order)), project.name.casefold()),
+        )

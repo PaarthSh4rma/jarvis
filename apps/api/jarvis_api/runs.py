@@ -278,7 +278,7 @@ class RunExecutor:
                 emitted_delta = True
                 self.store.append_event(run_id, "assistant.delta", {"content": content})
 
-            def progress(event_type: str, tool_name: str, message_text: str) -> None:
+            def progress(event_type: str, identifier: str, message_text: str) -> None:
                 current = self.store.snapshot(run_id)
                 if current.state in TERMINAL_STATES or current.state == RunState.CANCELLING:
                     return
@@ -287,11 +287,14 @@ class RunExecutor:
                         run_id,
                         RunState.WAITING_FOR_TOOL,
                         event_type,
-                        {"tool": tool_name, "message": message_text},
+                        {"tool": identifier, "message": message_text},
                     )
                 else:
+                    identifier_key = "skill" if event_type.startswith("skill.") else "tool"
                     self.store.append_event(
-                        run_id, event_type, {"tool": tool_name, "message": message_text}
+                        run_id,
+                        event_type,
+                        {identifier_key: identifier, "message": message_text},
                     )
                 if event_type in {"tool.completed", "tool.failed"}:
                     current = self.store.snapshot(run_id)

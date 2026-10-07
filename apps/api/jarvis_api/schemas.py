@@ -10,6 +10,7 @@ class HealthResponse(BaseModel):
     version: str
     ollama: Literal["online", "offline"]
     model: str
+    demo_mode: bool = False
 
 
 class ChatRequest(BaseModel):
@@ -82,6 +83,18 @@ class ProjectsResponse(BaseModel):
     recent_projects: list[ProjectResponse]
     count: int
     dirty_count: int
+
+
+class SkillResponse(BaseModel):
+    name: str
+    description: str
+    scope: Literal["project"]
+    version: int
+
+
+class SkillsResponse(BaseModel):
+    skills: list[SkillResponse]
+    count: int
 
 
 class MemoryCreateRequest(BaseModel):

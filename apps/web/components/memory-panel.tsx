@@ -98,7 +98,7 @@ export function MemoryPanel({ projects }: { projects: Project[] }) {
   return (
     <section className="memory" aria-labelledby="memory-title">
       <div className="section-label">
-        <span>04</span><h2 id="memory-title">MEMORY</h2><i />
+        <span>05</span><h2 id="memory-title">MEMORY</h2><i />
         <div className="memory-tabs" aria-label="Memory scope">
           <button className={scope === "user" ? "active" : ""} onClick={() => changeScope("user")}>USER MEMORY</button>
           <button className={scope === "project" ? "active" : ""} onClick={() => changeScope("project")}>PROJECT MEMORY</button>

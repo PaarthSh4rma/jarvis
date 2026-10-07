@@ -4,6 +4,7 @@ export type HealthResponse = {
   version: string;
   ollama: "online" | "offline";
   model: string;
+  demo_mode: boolean;
 };
 
 export type ChatResponse = {
@@ -54,6 +55,18 @@ export type ProjectsResponse = {
   dirty_count: number;
 };
 
+export type Skill = {
+  name: string;
+  description: string;
+  scope: "project";
+  version: number;
+};
+
+export type SkillsResponse = {
+  skills: Skill[];
+  count: number;
+};
+
 export type MemoryScope = "user" | "project";
 
 export type MemoryEntry = {
@@ -80,6 +93,91 @@ export class ApiError extends Error {
   }
 }
 
+export type HermesStatus = {
+  state: "ONLINE" | "OFFLINE" | "DEGRADED" | "UNKNOWN";
+  version: string | null;
+  capabilities: string[];
+  checked_at: string;
+  last_successful_check: string | null;
+  reason: "verified" | "unavailable" | "authentication_required" | "invalid_response" | "http_error";
+};
+
+const hermesCapabilities = new Set([
+  "run_submission", "run_status", "run_events_sse", "run_stop",
+  "run_approval_response", "session_resources",
+]);
+
+async function getHermesStatus(path: "health" | "capabilities", signal?: AbortSignal): Promise<HermesStatus> {
+  const response = await fetch(`${getApiUrl()}/integrations/hermes/${path}`, { cache: "no-store", signal });
+  if (!response.ok) throw new ApiError("Hermes status is unavailable.", response.status);
+  const data = (await response.json()) as Partial<HermesStatus> | null;
+  if (!data || !["ONLINE", "OFFLINE", "DEGRADED", "UNKNOWN"].includes(data.state ?? "")
+    || !(data.version === null || (typeof data.version === "string" && /^[a-zA-Z0-9.+_-]{1,64}$/.test(data.version)))
+    || !Array.isArray(data.capabilities) || data.capabilities.length > 6
+    || !data.capabilities.every((item) => hermesCapabilities.has(item))
+    || typeof data.checked_at !== "string" || !Number.isFinite(Date.parse(data.checked_at))
+    || !(data.last_successful_check === null || (typeof data.last_successful_check === "string" && Number.isFinite(Date.parse(data.last_successful_check))))
+    || !["verified", "unavailable", "authentication_required", "invalid_response", "http_error"].includes(data.reason ?? "")) {
+    throw new ApiError("Hermes returned an invalid status response.");
+  }
+  return data as HermesStatus;
+}
+
+export const getHermesHealth = (signal?: AbortSignal) => getHermesStatus("health", signal);
+export const getHermesCapabilities = (signal?: AbortSignal) => getHermesStatus("capabilities", signal);
+
+export type MissionType = "CODE_CHANGE" | "PROJECT_REVIEW" | "JOB_APPLICATION" | "RESEARCH" | "INTERVIEW_PREP" | "MONEY_EXPERIMENT" | "ADMIN";
+export type MissionStatus = "DRAFT" | "READY" | "RUNNING" | "WAITING_FOR_APPROVAL" | "COMPLETED" | "FAILED" | "CANCELLED";
+
+export type Mission = {
+  id: string;
+  type: MissionType;
+  title: string;
+  goal: string;
+  project_id: string | null;
+  context: string | null;
+  requested_by: string;
+  status: MissionStatus;
+  created_at: string;
+  updated_at: string;
+  revision: number;
+  external_execution_id: string | null;
+  result_summary: string | null;
+  failure_summary: string | null;
+};
+
+export type MissionCreateInput = {
+  type: MissionType;
+  title: string;
+  goal: string;
+  project_id: string | null;
+  context: string | null;
+};
+
+export type MissionPatchInput = Partial<Pick<Mission, "title" | "goal" | "project_id" | "context">> & {
+  expected_revision: number;
+  status?: "DRAFT" | "READY" | "CANCELLED";
+};
+
+export type ApprovalStatus = "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
+
+export type Approval = {
+  id: string;
+  mission_id: string;
+  action_type: string;
+  summary: string;
+  risk_context: string;
+  status: ApprovalStatus;
+  created_at: string;
+  resolved_at: string | null;
+  resolution_note: string | null;
+};
+
+export type ApprovalResolution = {
+  status: "APPROVED" | "REJECTED" | "CANCELLED";
+  resolution_note: string | null;
+};
+
 type BrowserLocation = Pick<Location, "hostname" | "protocol">;
 
 export function resolveApiUrl(
@@ -96,6 +194,85 @@ function getApiUrl(): string {
   return resolveApiUrl(process.env.NEXT_PUBLIC_API_URL, browserLocation);
 }
 
+export async function listMissions(signal?: AbortSignal): Promise<Mission[]> {
+  const response = await fetch(`${getApiUrl()}/missions`, { cache: "no-store", signal });
+  if (!response.ok) throw await apiError(response, "Mission registry is unavailable.");
+  const data = (await response.json()) as unknown;
+  if (!Array.isArray(data) || !data.every(isMission)) throw new ApiError("The mission registry returned an invalid response.");
+  return data;
+}
+
+export async function getMission(missionId: string, signal?: AbortSignal): Promise<Mission> {
+  const response = await fetch(`${getApiUrl()}/missions/${encodeURIComponent(missionId)}`, { cache: "no-store", signal });
+  if (!response.ok) throw await apiError(response, "Could not load mission.");
+  return parseMission(await response.json());
+}
+
+export async function createMission(input: MissionCreateInput): Promise<Mission> {
+  const response = await fetch(`${getApiUrl()}/missions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await apiError(response, "Could not create mission.");
+  return parseMission(await response.json());
+}
+
+export async function updateMission(missionId: string, input: MissionPatchInput): Promise<Mission> {
+  const response = await fetch(`${getApiUrl()}/missions/${encodeURIComponent(missionId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await apiError(response, "Could not update mission.");
+  return parseMission(await response.json());
+}
+
+export async function listApprovals(signal?: AbortSignal): Promise<Approval[]> {
+  const response = await fetch(`${getApiUrl()}/approvals`, { cache: "no-store", signal });
+  if (!response.ok) throw await apiError(response, "Approval registry is unavailable.");
+  const data = (await response.json()) as unknown;
+  if (!Array.isArray(data) || !data.every(isApproval)) throw new ApiError("The approval registry returned an invalid response.");
+  return data;
+}
+
+export async function resolveApproval(approvalId: string, input: ApprovalResolution): Promise<Approval> {
+  const response = await fetch(`${getApiUrl()}/approvals/${encodeURIComponent(approvalId)}/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw await apiError(response, "Could not record approval decision.");
+  const data = (await response.json()) as unknown;
+  if (!isApproval(data)) throw new ApiError("The approval registry returned an invalid response.");
+  return data;
+}
+
+function parseMission(data: unknown): Mission {
+  if (!isMission(data)) throw new ApiError("The mission registry returned an invalid response.");
+  return data;
+}
+
+function isMission(data: unknown): data is Mission {
+  if (!data || typeof data !== "object") return false;
+  const item = data as Partial<Mission>;
+  return typeof item.id === "string"
+    && typeof item.title === "string"
+    && typeof item.goal === "string"
+    && typeof item.revision === "number"
+    && ["DRAFT", "READY", "RUNNING", "WAITING_FOR_APPROVAL", "COMPLETED", "FAILED", "CANCELLED"].includes(item.status ?? "");
+}
+
+function isApproval(data: unknown): data is Approval {
+  if (!data || typeof data !== "object") return false;
+  const item = data as Partial<Approval>;
+  return typeof item.id === "string"
+    && typeof item.mission_id === "string"
+    && typeof item.summary === "string"
+    && typeof item.risk_context === "string"
+    && ["PENDING", "APPROVED", "REJECTED", "CANCELLED"].includes(item.status ?? "");
+}
+
 export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
   const response = await fetch(`${getApiUrl()}/health`, { cache: "no-store", signal });
   if (!response.ok) throw new Error(`Health check failed: ${response.status}`);
@@ -106,10 +283,11 @@ export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
     typeof data.version !== "string" ||
     !["online", "offline"].includes(data.ollama ?? "") ||
     typeof data.model !== "string"
+    || (data.demo_mode !== undefined && typeof data.demo_mode !== "boolean")
   ) {
     throw new Error("Invalid health response");
   }
-  return data as HealthResponse;
+  return { ...data, demo_mode: data.demo_mode ?? false } as HealthResponse;
 }
 
 export async function createConversation(signal?: AbortSignal): Promise<ConversationResponse> {
@@ -242,6 +420,16 @@ export async function getProjects(signal?: AbortSignal): Promise<ProjectsRespons
     throw new ApiError("The project index returned an invalid response.");
   }
   return data as ProjectsResponse;
+}
+
+export async function getSkills(signal?: AbortSignal): Promise<SkillsResponse> {
+  const response = await fetch(`${getApiUrl()}/skills`, { cache: "no-store", signal });
+  if (!response.ok) throw new ApiError("Skill registry is unavailable.", response.status);
+  const data = (await response.json()) as Partial<SkillsResponse>;
+  if (!Array.isArray(data.skills) || typeof data.count !== "number") {
+    throw new ApiError("The skill registry returned an invalid response.");
+  }
+  return data as SkillsResponse;
 }
 
 export async function getMemory(

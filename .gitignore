@@ -1,6 +1,7 @@
 # Dependencies and builds
 node_modules/
 .next/
+.next-demo/
 out/
 coverage/
 *.tsbuildinfo
@@ -21,6 +22,8 @@ __pycache__/
 *.db-shm
 *.db-wal
 data/
+.demo/
+demo-output/
 
 # Editors and macOS
 .DS_Store
