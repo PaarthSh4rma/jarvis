@@ -1,6 +1,6 @@
 # JARVIS
 
-A local-first personal assistant and developer command centre. V0.7 adds a bounded declarative skills registry while preserving the validated V0.6 execution runtime.
+A local-first personal assistant and developer command centre. V0.8.0 adds the Stark-style command centre, read-only Hermes readiness, and durable Mission and Approval controls while preserving local-first safety boundaries. See the [V0.8.0 release notes](RELEASE_NOTES.md).
 
 ## Prerequisites
 
@@ -82,7 +82,7 @@ npm run dev:web
 
 Open [http://localhost:3000](http://localhost:3000). The dashboard reports API and Ollama health independently. Messages travel only from the browser to FastAPI and from FastAPI to local Ollama; the browser never receives a general Ollama proxy.
 
-## Hermes foundation (unreleased, based on V0.7)
+## V0.8.0 command centre and control-plane foundation
 
 The Systems section now checks Hermes independently of Ollama and chat. It shows
 gateway liveness, verified version, a limited advertised-capability summary, and
@@ -149,7 +149,8 @@ conflicting later decisions return 409. Mission and approval lists accept `limit
 (default 50, max 100) and `offset`. Unknown mutation fields are rejected.
 Revisions and offsets have SQLite-compatible integer bounds. Database connections
 enable foreign-key enforcement; legacy orphan approvals cannot be resolved.
-There is no mission/approval panel yet; these are backend foundations.
+The command centre includes Mission and Approval panels for these durable records.
+Neither panel dispatches work or performs an approved action.
 
 ### Ownership and security
 

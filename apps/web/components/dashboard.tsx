@@ -317,7 +317,7 @@ export function Dashboard() {
 
       <footer>
         <span><ShieldCheck size={14} /> LOCAL-FIRST // HUMAN-DIRECTED</span>
-        <span><Github size={14} /> EXECUTION BUILD 0.7.0</span>
+        <span><Github size={14} /> EXECUTION BUILD 0.8.0</span>
       </footer>
     </main>
   );

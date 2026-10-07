@@ -53,7 +53,7 @@ it.each([true, false])("keeps Hermes controls visible with Ollama offline (Herme
     if (url.includes("/integrations/hermes/")) return hermesAvailable
       ? Promise.resolve(reply(online)) : Promise.reject(new Error("offline"));
     if (url.endsWith("/health")) return Promise.resolve(reply({
-      status: "ok", service: "jarvis-api", version: "0.7.0", ollama: "offline", model: "local",
+      status: "ok", service: "jarvis-api", version: "0.8.0", ollama: "offline", model: "local",
     }));
     if (url.endsWith("/projects")) return Promise.resolve(reply({ projects: [], recent_projects: [], count: 0, dirty_count: 0 }));
     if (url.endsWith("/skills")) return Promise.resolve(reply({ skills: [], count: 0 }));

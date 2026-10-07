@@ -54,7 +54,7 @@ from jarvis_api.schemas import (
 from jarvis_api.skills import SkillRegistry, SkillRegistryError
 from jarvis_api.tools import ToolRegistry
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 settings = get_settings()
 engine = create_database_engine(settings.database_url)
 ollama_service = OllamaService(settings.ollama_base_url, settings.ollama_model)

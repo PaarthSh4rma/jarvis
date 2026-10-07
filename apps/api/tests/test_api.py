@@ -176,7 +176,7 @@ def test_health_reports_ollama_and_model() -> None:
     assert response.json() == {
         "status": "ok",
         "service": "jarvis-api",
-        "version": "0.7.0",
+        "version": "0.8.0",
         "ollama": "online",
         "model": "test-model",
         "demo_mode": False,
